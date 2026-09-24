@@ -1,0 +1,36 @@
+name: Map report
+description: Tried a Workshop map? Tell us how it went (works, crashes, won't convert).
+labels: [map-report]
+body:
+  - type: input
+    id: map
+    attributes:
+      label: Workshop map
+      description: Name and Workshop ID (the number in the Steam URL)
+      placeholder: LEVIATHAN - 2112576356
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: What happened
+      options:
+        - Works
+        - Works, but something looks/sounds off
+        - Crashes in game
+        - Won't convert
+    validations:
+      required: true
+  - type: input
+    id: console
+    attributes:
+      label: Console
+      description: BO3 title ID / region, firmware, GoldHEN version
+      placeholder: CUSA02626 (EU), 7.55, GoldHEN 2.4
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: >
+        When it crashes (loading, entering an area, a weapon...), `bo3ps4.py compat` output, and the kernel log
+        around the crash if you have it (GoldHEN TTYRedirect on, klog port 3232). Strip your Steam/PSN names from logs.

@@ -1,0 +1,17 @@
+name: Bug
+description: Something in the pipeline itself is broken (setup, download, upload, a crash in bo3ps4.py).
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and what it printed.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: bo3ps4.py doctor
+      description: Its output (drop your PS4 address if you like).
+      render: text

@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: PS4-BO3-Customs (the converter and in-game mod this builds on)
+    url: https://github.com/ItsJokerZz/PS4-BO3-Customs
+    about: Problems in FFPorter or BO3-Customs.sprx themselves belong upstream.

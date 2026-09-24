@@ -1,0 +1,16 @@
+# your settings (PS4 address, paths, Steam account)
+config.json
+
+# built / downloaded: never commit game files or binaries built from them
+ffport/
+upstream/
+*.zip
+*.ff
+*.xpak
+*.sabl
+*.sabs
+
+# logs and local results (they can contain your Steam account name)
+*.log
+compat.json
+__pycache__/

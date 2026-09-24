@@ -1,0 +1,2391 @@
+--- a/Tool/src/FFPorter.Cli.T7/T7Cli.cs
++++ b/Tool/src/FFPorter.Cli.T7/T7Cli.cs
+@@ -193,7 +193,8 @@
+         string work = Path.Combine(T7Paths.Work(workspace), stem);
+         string loader = T7Paths.Ps4Loader(workspace);
+         string image = options.Value("--image") ?? T7Paths.PcImage(workspace);
+-        if (!File.Exists(image))
++        // The shipped PC image is a segments folder (T7Paths.PcImage), not a dump file.
++        if (!File.Exists(image) && !File.Exists(Path.Combine(image, "segments.json")))
+             throw new IOException($"The BlackOps3 PC dump was not found ({image}); pass --image");
+         if (!File.Exists(Path.Combine(loader, "segments.json")))
+             throw new IOException($"The PS4 loader data is missing ({loader})");
+--- a/Tool/src/FFPorter.Core.T7/T7Paths.cs
++++ b/Tool/src/FFPorter.Core.T7/T7Paths.cs
+@@ -4,7 +4,10 @@
+ 
+ public static class T7Paths
+ {
+-    public static string Ps4Loader(Workspace workspace) => ToolData.Locate(workspace, "t7_ps4_image");
++    // T7_PS4_IMAGE: a t7_ps4_image folder built from the user's own console (bo3_ps4image.py) instead of the shipped one.
++    // The t7_gsc tables are looked up beside it, so that folder's parent needs a t7_gsc too.
++    public static string Ps4Loader(Workspace workspace) =>
++        Environment.GetEnvironmentVariable("T7_PS4_IMAGE") is { Length: > 0 } image ? image : ToolData.Locate(workspace, "t7_ps4_image");
+ 
+     public static string Gsc(Workspace workspace) => ToolData.Locate(workspace, "t7_gsc");
+ 
+--- a/Tool/src/FFPorter.Core.T7/Port/T7ZonePort.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/T7ZonePort.cs
+@@ -174,7 +174,7 @@
+                     continue;
+                 }
+                 fidelity?.BeginAsset(asset);
+-                if (TryRehome(context, cell, output, out string? rehomeProblem))
++                if (TryRehome(context, i, cell, output, out string? rehomeProblem))
+                 {
+                     strategies["re-homed from texturecombo"] = strategies.GetValueOrDefault("re-homed from texturecombo") + 1;
+                     outputs[i] = output;
+@@ -280,6 +280,23 @@
+             builder.MapAsset(pc, i, outputIndex[i]);
+         }
+         RemapDonors(builder, pc, outputs, outputIndex, options.Donors);
++        int carried = AddDonorDependencies(builder, options.Donors, context.InlineDonors, message => log($"[{stem}] {message}"));
++        if (carried > 0)
++            strategies["donor dependency (carried along)"] = carried;
++        var usedZones = builder.Assets.Where(o => o.Origin.StartsWith("donor ", StringComparison.Ordinal))
++            .Select(o => o.Origin[6..].Split('#')[0]).ToHashSet(StringComparer.Ordinal);
++        usedZones.UnionWith(context.InlineDonors.Select(d => d.Zone.Label));
++        int released = options.Donors.Release(usedZones);
++        if (released > 0)
++            log($"[{stem}] released {released} PS4 reference zones the output doesn't copy from ({usedZones.Count} kept)");
++        if (Environment.GetEnvironmentVariable("FFPORTER_DUMP_OUTPUTS") == "1")
++        {
++            File.WriteAllLines(Path.Combine(options.WorkDirectory, stem + ".outputs.txt"), builder.Assets.Select((o, n) =>
++                $"{n}\t{T7AssetTypes.Name(o.Type)}\t{o.Name}\t{o.Origin}\tmain={o.Main.Sum(PieceSize)}\tdeferred={o.Deferred.Sum(PieceSize)}"));
++            foreach (T7WalkIndex zone in options.Donors.Zones)
++                File.WriteAllLines(Path.Combine(options.WorkDirectory, $"{stem}.donor.{zone.Label}.txt"), zone.Walk.Assets.Select(a =>
++                    $"{a.Index}\t{T7AssetTypes.Name(a.Type)}\t{a.Name}\t{a.Start:x}-{a.End:x}\tdeps={string.Join(",", T7DonorLibrary.Dependencies(zone, a))}"));
++        }
+ 
+         fidelity?.Enter(T7Fidelity.ZonePhase(options.PcFastFile, "link"), "Linking and checking", $"{zoneFile} with the PS4 game's loader");
+         var linker = new T7Linker(options.Ps4LoaderDirectory, options.WorkDirectory, log)
+@@ -374,7 +391,7 @@
+         fidelity?.Step(1, $"{xpakFile} · done");
+     }
+ 
+-    private static bool TryRehome(T7PortContext context, long cell, T7OutputAsset output, out string? problem)
++    private static bool TryRehome(T7PortContext context, int pcIndex, long cell, T7OutputAsset output, out string? problem)
+     {
+         problem = null;
+         foreach (T7TextureComboFallout fallout in context.Fallouts)
+@@ -385,6 +402,16 @@
+             output.HeaderMarker = ulong.MaxValue;
+             output.Main.Clear();
+             output.Deferred.Clear();
++            // A technique set with techniques needs the PS4 compiler; without one, take the PS4 build of it (or the
++            // nearest PS4 technique set) from the donor zones, as the donor converter does for top-level techsets.
++            if (subAsset.Type == T7AssetTypes.TechniqueSet && context.ShaderCompiler == null
++                && !T7TechsetConverter.IsStub(context.Pc.Zone, fallout.Asset.Reads[subAsset.FirstRead]))
++            {
++                if (TryRehomeTechsetFromDonor(context, pcIndex, subAsset.Name.TrimStart(','), output))
++                    return true;
++                problem = $"cannot re-home techset '{subAsset.Name}' out of the texturecombo: no PS4 donor technique set, and no PS4 shader compiler";
++                return false;
++            }
+             try
+             {
+                 var rewrite = new T7AssetRewrite(context, fallout.Asset, output, subAsset.FirstRead);
+@@ -402,6 +429,35 @@
+         return false;
+     }
+ 
++    private static bool TryRehomeTechsetFromDonor(T7PortContext context, int pcIndex, string pcName, T7OutputAsset output)
++    {
++        const int type = T7AssetTypes.TechniqueSet;
++        string wanted = T7Names.ToPs4(type, pcName);
++        bool exact = context.Donors.TryFindForCopy(type, wanted, out T7WalkIndex? donor, out T7Walk.Asset? donorAsset, out bool clean);
++        string? used = wanted;
++        if (!exact || !clean)
++        {
++            // As the donor converter: the nearest technique set with a copy that can be carried whole, else any.
++            string? nearest = context.Donors.NearestClean(type, wanted) ?? (exact ? null : context.Donors.Nearest(type, wanted));
++            if (nearest != null && context.Donors.TryFindForCopy(type, nearest, out T7WalkIndex? other, out T7Walk.Asset? otherAsset))
++            {
++                (donor, donorAsset, used, exact) = (other, otherAsset, nearest, false);
++            }
++            else if (!exact)
++            {
++                return false;
++            }
++        }
++        T7CopyConverter.CopyWhole(donor!, donorAsset!, output);
++        output.Origin = $"donor {donor!.Label}#{donorAsset!.Index}";
++        context.Builder.MapAsset(donor, donorAsset.Index, context.OutputIndexOfPc[pcIndex]);
++        if (exact)
++            context.Warn(T7Issues.TechniqueSetDonor, $"techset '{pcName}' re-homed from the texturecombo as PS4 donor '{wanted}' ({donor.Label})", pcName);
++        else
++            context.Warn(T7Issues.TechniqueSetSubstitute, $"techset '{pcName}': no PS4 '{wanted}'; using nearest PS4 '{used}' ({donor.Label}){T7DonorLibrary.AddedFeatures(wanted, used!)}", $"{pcName} -> {used}");
++        return true;
++    }
++
+     public static void ConvertSubAsset(T7PortContext context, T7AssetRewrite rewrite, T7TextureComboFallout.SubAsset subAsset)
+     {
+         switch (subAsset.Type)
+@@ -490,6 +546,72 @@
+             output.HeaderMarker = pc.List.Assets[index].Header;
+     }
+ 
++    // The PS4 linker stores data shared by several assets once, so a donor asset can point into other assets of its
++    // zone. Carry those along (whole, as extra assets) so the pointers land on data the loader reads.
++    private static long PieceSize(T7Piece piece) => piece.Length;
++
++    private static int AddDonorDependencies(T7ZoneBuilder builder, T7DonorLibrary donors, IEnumerable<(T7WalkIndex Zone, T7Walk.Asset Asset)> inline, Action<string> log, int limit = 256)
++    {
++        var queue = new Queue<(T7WalkIndex Zone, T7Walk.Asset Asset)>(inline);
++        foreach (T7OutputAsset output in builder.Assets.ToList())
++        {
++            if (!output.Origin.StartsWith("donor ", StringComparison.Ordinal))
++                continue;
++            string[] parts = output.Origin[6..].Split('#');
++            T7WalkIndex? zone = donors.Zones.FirstOrDefault(z => z.Label == parts[0]);
++            if (zone != null && parts.Length > 1 && int.TryParse(parts[1], out int index) && index < zone.Walk.Assets.Count)
++                queue.Enqueue((zone, zone.Walk.Assets[index]));
++        }
++        int added = 0;
++        while (queue.Count > 0)
++        {
++            (T7WalkIndex zone, T7Walk.Asset asset) = queue.Dequeue();
++            var spans = new List<(long Start, long Size)> { (asset.Start, asset.End - asset.Start) };
++            spans.AddRange(asset.Deferred.Select(d => (d.FileOffset, d.Size)));
++            foreach ((long start, long size) in spans)
++            {
++                foreach ((long field, T7PointerKind kind, T7BlockAddress target) in zone.PointersIn(start, size))
++                {
++                    if (kind is not (T7PointerKind.Packed or T7PointerKind.PackedAlias))
++                        continue;
++                    int other = T7DonorLibrary.ReferencedAsset(zone, field, target);
++                    if (other < 0 || other == asset.Index)
++                        continue;
++                    T7Walk.Asset shared = zone.Walk.Assets[other];
++                    if (shared.Type is not (T7AssetTypes.TechniqueSet or T7AssetTypes.ComputeShaderSet))
++                    {
++                        // Only shader sets come along: anything else a borrowed shader set touches (a model or weapon
++                        // that happens to hold shared data) would drag in half the zone. The link reports what's left.
++                        log($"donor dependency: not carrying {T7AssetTypes.Name(shared.Type)} '{shared.Name}' ({zone.Label}#{other}) for '{asset.Name}'");
++                        continue;
++                    }
++                    if (builder.TryMapped(zone, other, out int mapped))
++                    {
++                        // Already in the output as this exact build: fine. Another build of it (a different zone's, or the
++                        // map's own): carry this one too, so the pointers land on its data.
++                        if (builder.Assets[mapped].Origin == $"donor {zone.Label}#{other}")
++                            continue;
++                    }
++                    if (added >= limit)
++                    {
++                        log($"donor dependencies: stopped at {limit} carried assets");
++                        return added;
++                    }
++                    T7Walk.Asset dependency = zone.Walk.Assets[other];
++                    var extra = new T7OutputAsset { Type = dependency.Type, Name = dependency.Name, HeaderMarker = ulong.MaxValue };
++                    T7CopyConverter.CopyWhole(zone, dependency, extra);
++                    extra.Origin = $"donor {zone.Label}#{dependency.Index}";
++                    builder.Assets.Add(extra);
++                    builder.MapAsset(zone, dependency.Index, builder.Assets.Count - 1);
++                    queue.Enqueue((zone, dependency));
++                    added++;
++                    log($"donor dependency: carried {T7AssetTypes.Name(dependency.Type)} '{dependency.Name}' ({zone.Label}#{dependency.Index}) for '{asset.Name}'");
++                }
++            }
++        }
++        return added;
++    }
++
+     private static void RemapDonors(T7ZoneBuilder builder, T7WalkIndex pc, T7OutputAsset?[] outputs, int[] outputIndex, T7DonorLibrary donors)
+     {
+         var byName = new Dictionary<(int Type, string Name), int>();
+--- a/Tool/src/FFPorter.Core.T7/Port/T7DonorLibrary.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/T7DonorLibrary.cs
+@@ -1,190 +1,442 @@
+-using System.Text;
+-using FFPorter.Core.Common.Native;
+-using FFPorter.Core.T7.Harness;
+-using FFPorter.Core.T7.Link;
+-
+-namespace FFPorter.Core.T7.Port;
+-
+-public sealed class T7DonorLibrary
+-{
+-    public const int EagerLimit = 8;
+-
+-    private readonly List<T7WalkIndex> _zones = [];
+-    private readonly Dictionary<(int Type, string Name), List<(T7WalkIndex Zone, T7Walk.Asset Asset)>> _assets = [];
+-    private readonly Dictionary<string, List<string>> _catalog = new(StringComparer.Ordinal);
+-    private readonly HashSet<string> _walkedFiles = new(StringComparer.OrdinalIgnoreCase);
+-    private string _loaderDirectory = "", _cacheDirectory = "";
+-    private Action<string> _log = _ => { };
+-
+-    public IReadOnlyList<T7WalkIndex> Zones => _zones;
+-
+-    public int AssetCount => _assets.Count;
+-
+-    public int CataloguedNames => _catalog.Count;
+-
+-    public static T7DonorLibrary Load(IEnumerable<string> fastFiles, string loaderDirectory, string cacheDirectory, Action<string> log)
+-    {
+-        var library = new T7DonorLibrary { _loaderDirectory = loaderDirectory, _cacheDirectory = cacheDirectory, _log = log };
+-        Directory.CreateDirectory(cacheDirectory);
+-        List<string> ps4 = fastFiles.Where(IsPs4Zone).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+-        if (ps4.Count <= EagerLimit)
+-        {
+-            foreach (string file in ps4)
+-                library.WalkFile(file);
+-            log($"PS4 reference library: {library._zones.Count} zones, {library._assets.Count} named assets");
+-        }
+-        else
+-        {
+-            int done = 0;
+-            foreach (string file in ps4.OrderBy(f => new FileInfo(f).Length))
+-            {
+-                foreach (string name in library.HashedNames(file))
+-                {
+-                    if (!library._catalog.TryGetValue(name, out List<string>? files))
+-                        library._catalog[name] = files = [];
+-                    files.Add(file);
+-                }
+-                if (++done % 50 == 0 || done == ps4.Count)
+-                    log($"PS4 reference catalog: {done}/{ps4.Count} zones indexed");
+-            }
+-            log($"PS4 reference catalog: {ps4.Count} zones, {library._catalog.Count} hashed asset names (zones are walked on demand)");
+-        }
+-        return library;
+-    }
+-
+-    private static bool IsPs4Zone(string file)
+-    {
+-        try
+-        {
+-            byte[] head = new byte[T7Header.Size];
+-            using FileStream stream = File.OpenRead(file);
+-            return stream.Read(head) == head.Length && T7Header.Parse(head).Platform == 2;
+-        }
+-        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
+-        {
+-            return false;
+-        }
+-    }
+-
+-    internal static string CacheKey(string file) => T7FastFileDelta.CacheKey(file);
+-
+-    private bool WalkFile(string file)
+-    {
+-        if (!_walkedFiles.Add(file))
+-            return false;
+-        try
+-        {
+-            string source = T7FastFileDelta.Resolve(file, _cacheDirectory, _log);
+-            string walkPath = Path.Combine(_cacheDirectory, $"{Path.GetFileNameWithoutExtension(file)}.{CacheKey(file)}.ps4.t7walk");
+-            if (!File.Exists(walkPath))
+-            {
+-                _log($"walking PS4 reference zone {Path.GetFileName(file)}");
+-                string partial = walkPath + ".partial";
+-                NativeProcessResult result = NativeProcess.Run(T7Ps4Loader.TaskName, T7Ps4Loader.ChildArguments(_loaderDirectory, partial, source));
+-                if (result.ExitCode != 0)
+-                {
+-                    _log($"  skipped {Path.GetFileName(file)}: PS4 walk failed ({result.ExitCode}) {result.Stderr.Trim()}");
+-                    return false;
+-                }
+-                File.Move(partial, walkPath, overwrite: true);
+-            }
+-            Add(T7WalkIndex.Load(Path.GetFileNameWithoutExtension(file), source, walkPath));
+-            return true;
+-        }
+-        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
+-        {
+-            _log($"  skipped {Path.GetFileName(file)}: {error.Message}");
+-            return false;
+-        }
+-    }
+-
+-    private IReadOnlyList<string> HashedNames(string file) => HashedNames(file, _cacheDirectory, _log);
+-
+-    internal static IReadOnlyList<string> HashedNames(string file, string cacheDirectory, Action<string> log)
+-    {
+-        string cache = Path.Combine(cacheDirectory, "names", $"{Path.GetFileNameWithoutExtension(file)}.{CacheKey(file)}.names.txt");
+-        if (File.Exists(cache))
+-            return File.ReadAllLines(cache);
+-        var names = new HashSet<string>(StringComparer.Ordinal);
+-        try
+-        {
+-            byte[] zone = T7FastFileDelta.LoadPatched(file).Zone;
+-            ReadOnlySpan<byte> span = zone;
+-            for (int at = span.IndexOf((byte)'#'); at >= 0;)
+-            {
+-                if (at + 9 < span.Length && span[at + 9] == 0 && IsHex(span.Slice(at + 1, 8)))
+-                {
+-                    int start = at;
+-                    while (start > 0 && span[start - 1] is >= 0x20 and < 0x7F && at - start < 200)
+-                        start--;
+-                    if (start < at)
+-                        names.Add(Encoding.Latin1.GetString(span[start..(at + 9)]));
+-                }
+-                int next = span[(at + 1)..].IndexOf((byte)'#');
+-                at = next < 0 ? -1 : at + 1 + next;
+-            }
+-        }
+-        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
+-        {
+-            log($"  could not index {Path.GetFileName(file)}: {error.Message}");
+-            return [];
+-        }
+-        Directory.CreateDirectory(Path.GetDirectoryName(cache)!);
+-        File.WriteAllLines(cache, names.Order(StringComparer.Ordinal));
+-        return names.ToList();
+-    }
+-
+-    private static bool IsHex(ReadOnlySpan<byte> text)
+-    {
+-        foreach (byte c in text)
+-        {
+-            if (c is not ((>= (byte)'0' and <= (byte)'9') or (>= (byte)'a' and <= (byte)'f') or (>= (byte)'A' and <= (byte)'F')))
+-                return false;
+-        }
+-        return true;
+-    }
+-
+-    public void Add(T7WalkIndex zone)
+-    {
+-        _zones.Add(zone);
+-        foreach (T7Walk.Asset asset in zone.Walk.Assets)
+-        {
+-            string? name = asset.Name;
+-            if (string.IsNullOrEmpty(name) || asset.Reads.Count == 0)
+-                continue;
+-            if (!_assets.TryGetValue((asset.Type, name), out var candidates))
+-                _assets[(asset.Type, name)] = candidates = [];
+-            if (!candidates.Exists(c => c.Zone == zone))
+-                candidates.Add((zone, asset));
+-        }
+-    }
+-
+-    public string? PreferredZone { get; set; }
+-
+-    public bool TryFind(int type, string name, out T7WalkIndex? zone, out T7Walk.Asset? asset)
+-    {
+-        if (!_assets.ContainsKey((type, name)) && _catalog.TryGetValue(name, out List<string>? files))
+-        {
+-            foreach (string file in files)
+-            {
+-                if (_walkedFiles.Contains(file))
+-                    continue;
+-                WalkFile(file);
+-                if (_assets.ContainsKey((type, name)))
+-                    break;
+-            }
+-        }
+-        if (_assets.TryGetValue((type, name), out var candidates) && candidates.Count > 0)
+-        {
+-            var found = candidates.Find(c => string.Equals(c.Zone.Label, PreferredZone, StringComparison.OrdinalIgnoreCase));
+-            if (found.Zone == null)
+-                found = candidates[0];
+-            zone = found.Zone;
+-            asset = found.Asset;
+-            return true;
+-        }
+-        zone = null;
+-        asset = null;
+-        return false;
+-    }
+-}
++using System.Text;
++using FFPorter.Core.Common.Native;
++using FFPorter.Core.T7.Harness;
++using FFPorter.Core.T7.Link;
++
++namespace FFPorter.Core.T7.Port;
++
++public sealed class T7DonorLibrary
++{
++    public const int EagerLimit = 8;
++
++    private readonly List<T7WalkIndex> _zones = [];
++    private readonly Dictionary<(int Type, string Name), List<(T7WalkIndex Zone, T7Walk.Asset Asset)>> _assets = [];
++    private readonly Dictionary<string, List<string>> _catalog = new(StringComparer.Ordinal);
++    private readonly HashSet<string> _walkedFiles = new(StringComparer.OrdinalIgnoreCase);
++    private string _loaderDirectory = "", _cacheDirectory = "";
++    private Action<string> _log = _ => { };
++
++    public IReadOnlyList<T7WalkIndex> Zones => _zones;
++
++    public int AssetCount => _assets.Count;
++
++    public int CataloguedNames => _catalog.Count;
++
++    public static T7DonorLibrary Load(IEnumerable<string> fastFiles, string loaderDirectory, string cacheDirectory, Action<string> log)
++    {
++        var library = new T7DonorLibrary { _loaderDirectory = loaderDirectory, _cacheDirectory = cacheDirectory, _log = log };
++        Directory.CreateDirectory(cacheDirectory);
++        List<string> ps4 = fastFiles.Where(IsPs4Zone).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
++        if (ps4.Count <= EagerLimit)
++        {
++            foreach (string file in ps4)
++                library.WalkFile(file);
++            log($"PS4 reference library: {library._zones.Count} zones, {library._assets.Count} named assets");
++        }
++        else
++        {
++            int done = 0;
++            foreach (string file in ps4.OrderBy(f => new FileInfo(f).Length))
++            {
++                foreach (string name in library.HashedNames(file))
++                {
++                    if (!library._catalog.TryGetValue(name, out List<string>? files))
++                        library._catalog[name] = files = [];
++                    files.Add(file);
++                }
++                if (++done % 50 == 0 || done == ps4.Count)
++                    log($"PS4 reference catalog: {done}/{ps4.Count} zones indexed");
++            }
++            log($"PS4 reference catalog: {ps4.Count} zones, {library._catalog.Count} hashed asset names (zones are walked on demand)");
++        }
++        return library;
++    }
++
++    private static bool IsPs4Zone(string file)
++    {
++        try
++        {
++            byte[] head = new byte[T7Header.Size];
++            using FileStream stream = File.OpenRead(file);
++            return stream.Read(head) == head.Length && T7Header.Parse(head).Platform == 2;
++        }
++        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException)
++        {
++            return false;
++        }
++    }
++
++    internal static string CacheKey(string file) => T7FastFileDelta.CacheKey(file);
++
++    private bool WalkFile(string file)
++    {
++        if (!_walkedFiles.Add(file))
++            return false;
++        try
++        {
++            string source = T7FastFileDelta.Resolve(file, _cacheDirectory, _log);
++            string walkPath = Path.Combine(_cacheDirectory, $"{Path.GetFileNameWithoutExtension(file)}.{CacheKey(file)}.ps4.t7walk");
++            if (!File.Exists(walkPath))
++            {
++                _log($"walking PS4 reference zone {Path.GetFileName(file)}");
++                string partial = walkPath + ".partial";
++                NativeProcessResult result = NativeProcess.Run(T7Ps4Loader.TaskName, T7Ps4Loader.ChildArguments(_loaderDirectory, partial, source));
++                if (result.ExitCode != 0)
++                {
++                    _log($"  skipped {Path.GetFileName(file)}: PS4 walk failed ({result.ExitCode}) {result.Stderr.Trim()}");
++                    return false;
++                }
++                File.Move(partial, walkPath, overwrite: true);
++            }
++            Add(T7WalkIndex.Load(Path.GetFileNameWithoutExtension(file), source, walkPath));
++            return true;
++        }
++        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
++        {
++            _log($"  skipped {Path.GetFileName(file)}: {error.Message}");
++            return false;
++        }
++    }
++
++    private IReadOnlyList<string> HashedNames(string file) => HashedNames(file, _cacheDirectory, _log);
++
++    internal static IReadOnlyList<string> HashedNames(string file, string cacheDirectory, Action<string> log)
++    {
++        string cache = Path.Combine(cacheDirectory, "names", $"{Path.GetFileNameWithoutExtension(file)}.{CacheKey(file)}.names.txt");
++        if (File.Exists(cache))
++            return File.ReadAllLines(cache);
++        var names = new HashSet<string>(StringComparer.Ordinal);
++        try
++        {
++            byte[] zone = T7FastFileDelta.LoadPatched(file).Zone;
++            ReadOnlySpan<byte> span = zone;
++            for (int at = span.IndexOf((byte)'#'); at >= 0;)
++            {
++                if (at + 9 < span.Length && span[at + 9] == 0 && IsHex(span.Slice(at + 1, 8)))
++                {
++                    int start = at;
++                    while (start > 0 && span[start - 1] is >= 0x20 and < 0x7F && at - start < 200)
++                        start--;
++                    if (start < at)
++                        names.Add(Encoding.Latin1.GetString(span[start..(at + 9)]));
++                }
++                int next = span[(at + 1)..].IndexOf((byte)'#');
++                at = next < 0 ? -1 : at + 1 + next;
++            }
++        }
++        catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
++        {
++            log($"  could not index {Path.GetFileName(file)}: {error.Message}");
++            return [];
++        }
++        Directory.CreateDirectory(Path.GetDirectoryName(cache)!);
++        File.WriteAllLines(cache, names.Order(StringComparer.Ordinal));
++        return names.ToList();
++    }
++
++    private static bool IsHex(ReadOnlySpan<byte> text)
++    {
++        foreach (byte c in text)
++        {
++            if (c is not ((>= (byte)'0' and <= (byte)'9') or (>= (byte)'a' and <= (byte)'f') or (>= (byte)'A' and <= (byte)'F')))
++                return false;
++        }
++        return true;
++    }
++
++    public void Add(T7WalkIndex zone)
++    {
++        _zones.Add(zone);
++        foreach (T7Walk.Asset asset in zone.Walk.Assets)
++        {
++            string? name = asset.Name;
++            if (string.IsNullOrEmpty(name) || asset.Reads.Count == 0)
++                continue;
++            if (!_assets.TryGetValue((asset.Type, name), out var candidates))
++                _assets[(asset.Type, name)] = candidates = [];
++            if (!candidates.Exists(c => c.Zone == zone))
++                candidates.Add((zone, asset));
++        }
++    }
++
++    public string? PreferredZone { get; set; }
++
++    // Drops the walked zones no output copies from (each holds its whole decompressed zone), so the linker's walks have
++    // the memory; a later zone that needs one walks it again from the cached walk on disk.
++    public int Release(IReadOnlySet<string> keepLabels)
++    {
++        List<T7WalkIndex> drop = _zones.Where(z => !keepLabels.Contains(z.Label)).ToList();
++        if (drop.Count == 0)
++            return 0;
++        var dropped = drop.ToHashSet();
++        _zones.RemoveAll(dropped.Contains);
++        foreach (var key in _assets.Keys.ToList())
++        {
++            _assets[key].RemoveAll(c => dropped.Contains(c.Zone));
++            if (_assets[key].Count == 0)
++                _assets.Remove(key);
++        }
++        foreach (T7WalkIndex zone in drop)
++            _walkedFiles.RemoveWhere(f => string.Equals(Path.GetFileNameWithoutExtension(f), zone.Label, StringComparison.OrdinalIgnoreCase));
++        foreach (var key in _selfContained.Keys.Where(k => dropped.Contains(k.Zone)).ToList())
++            _selfContained.Remove(key);
++        GC.Collect();
++        GC.WaitForPendingFinalizers();
++        return drop.Count;
++    }
++
++    // The PS4 technique set closest to `ps4Name` (same folder and '#hash' family, most shared name words) that a donor
++    // zone can supply, for texturecombo techsets no PS4 zone has and no compiler can build.
++    // Name words `substitute` has that `original` lacks: features the substitute adds (it may sample textures the
++    // material doesn't have, which crashes the renderer where the surface is drawn). Empty for a safe substitute.
++    public static string AddedFeatures(string original, string substitute)
++    {
++        string[] have = Parts(original).Words, got = Parts(substitute).Words;
++        string extra = string.Join(",", got.Where(w => !have.Contains(w)));
++        return extra.Length == 0 ? "" : $" [ADDS {extra}: may crash where drawn]";
++    }
++
++    public string? Nearest(int type, string ps4Name) => Ranked(type, ps4Name).FirstOrDefault(c => TryFind(type, c, out _, out _));
++
++    // Like Nearest, but only a technique set with a copy the port can carry whole (its shared data sits in shader sets
++    // only): the retail PS4 zones store each shader program once, where it first appears, often inside a model.
++    public string? NearestClean(int type, string ps4Name, int tries = 12)
++    {
++        foreach (string candidate in Ranked(type, ps4Name).Take(tries))
++        {
++            if (TryFindForCopy(type, candidate, out _, out _, out bool clean, extraZones: 1) && clean)
++                return candidate;
++        }
++        return null;
++    }
++
++    // Technique sets of the same folder and '#hash' family as `ps4Name`, closest first (most shared name words, then
++    // fewest extra ones).
++    private IEnumerable<string> Ranked(int type, string ps4Name)
++    {
++        (string folder, string[] words, string hash) = Parts(ps4Name);
++        var scored = new List<(int Score, string Name)>();
++        foreach (string candidate in _catalog.Keys.Concat(_assets.Keys.Where(k => k.Type == type).Select(k => k.Name)).Distinct())
++        {
++            if (candidate == ps4Name)
++                continue;
++            (string f, string[] w, string h) = Parts(candidate);
++            if (f != folder || h != hash)
++                continue;
++            int shared = w.Intersect(words).Count();
++            // Only drop features, never add them: a technique set with extra name words ("_advanced", "_detail", ...)
++            // samples textures the map's material doesn't have, and the renderer's texture lookup then runs off the
++            // material's table (LEVIATHAN crashed entering a room: lit_vertscale_alphatest_nocull had become
++            // lit_alphatest_nocull_advanced).
++            if (shared == 0)
++                continue;
++            // Supersets only as a last resort (when nothing drops features): fewest extra words first.
++            int extra = w.Count(x => !words.Contains(x));
++            scored.Add((extra == 0 ? shared * 10 - words.Except(w).Count() : -1000 * extra + shared, candidate));
++        }
++        foreach ((int _, string name) in scored.OrderByDescending(s => s.Score).ThenBy(s => s.Name, StringComparer.Ordinal))
++            yield return name;
++        // Folderless technique sets are screen and 2D effects (e.g. Moon's helmet visor, "moon_helmet"); when none shares
++        // a name word, a plain alpha-blended 2D overlay draws it.
++        if (folder.Length == 0)
++            yield return $"2d_blend#{hash}";
++    }
++
++    private static (string Folder, string[] Words, string Hash) Parts(string name)
++    {
++        int hashAt = name.LastIndexOf('#');
++        string hash = hashAt > 0 ? name[(hashAt + 1)..] : "";
++        string stem = hashAt > 0 ? name[..hashAt] : name;
++        int slash = stem.LastIndexOf('/');
++        return (slash >= 0 ? stem[..slash] : "", stem[(slash + 1)..].Split('_', StringSplitOptions.RemoveEmptyEntries), hash);
++    }
++
++    public bool TryFind(int type, string name, out T7WalkIndex? zone, out T7Walk.Asset? asset)
++    {
++        if (!_assets.ContainsKey((type, name)) && _catalog.TryGetValue(name, out List<string>? files))
++        {
++            foreach (string file in files)
++            {
++                if (_walkedFiles.Contains(file))
++                    continue;
++                WalkFile(file);
++                if (_assets.ContainsKey((type, name)))
++                    break;
++            }
++        }
++        if (_assets.TryGetValue((type, name), out var candidates) && candidates.Count > 0)
++        {
++            var found = candidates.Find(c => string.Equals(c.Zone.Label, PreferredZone, StringComparison.OrdinalIgnoreCase));
++            if (found.Zone == null)
++                found = candidates[0];
++            if (!SelfContained(found.Zone, found.Asset))
++            {
++                // The PS4 linker shares identical data between assets, so a donor copy can point into other assets of
++                // its zone. Prefer a loaded copy that doesn't; otherwise the port carries the shared assets along.
++                var clean = candidates.Find(c => SelfContained(c.Zone, c.Asset));
++                if (clean.Zone != null)
++                    found = clean;
++            }
++            zone = found.Zone;
++            asset = found.Asset;
++            return true;
++        }
++        zone = null;
++        asset = null;
++        return false;
++    }
++
++    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<T7WalkIndex, Dictionary<(int, string), int>> ByName = new();
++
++    // The asset a pointer target in `zone` belongs to: the asset whose data holds it, the asset of a table entry, or
++    // the asset an inline registration cell names (these resolve by name at link time, so the asset must be present).
++    public static int ReferencedAsset(T7WalkIndex zone, long field, T7BlockAddress target)
++    {
++        if (zone.TryAliasOwner(target, out int owner))
++            return owner;
++        if (!zone.TryFileOffset(target, out long offset, field))
++            return -1;
++        long table = zone.List.AssetTableOffset;
++        if (offset >= table && offset < table + 16L * zone.List.Assets.Count)
++            return (int)((offset - table) / 16);
++        int asset = zone.AssetAt(offset);
++        if (asset >= 0)
++            return asset;
++        if (!zone.Pointers.TryGetValue(offset, out var cell) || cell.Kind is not (T7PointerKind.Inline or T7PointerKind.InlineAlias))
++            return -1;
++        int type;
++        string? name;
++        if (zone.TryInlineRegistration(offset, out T7Walk.Registration exact))
++            (type, name) = (exact.Type, exact.Name);
++        else if (!zone.TryRegistrationAt(cell.Target, offset, out type, out name))
++            return -1;
++        if (string.IsNullOrEmpty(name))
++            return -1;
++        Dictionary<(int, string), int> byName = ByName.GetValue(zone, z =>
++        {
++            var map = new Dictionary<(int, string), int>();
++            foreach (T7Walk.Asset a in z.Walk.Assets)
++                if (!string.IsNullOrEmpty(a.Name) && a.Reads.Count > 0)
++                    map.TryAdd((a.Type, a.Name), a.Index);
++            return map;
++        });
++        return byName.TryGetValue((type, name), out int found) ? found : -1;
++    }
++
++    // The other assets of `zone` that `asset`'s data points into (the PS4 linker stores shared data once).
++    public static IEnumerable<int> Dependencies(T7WalkIndex zone, T7Walk.Asset asset)
++    {
++        var spans = new List<(long Start, long Size)> { (asset.Start, asset.End - asset.Start) };
++        spans.AddRange(asset.Deferred.Select(d => (d.FileOffset, d.Size)));
++        var seen = new HashSet<int>();
++        foreach ((long start, long size) in spans)
++        {
++            foreach ((long field, T7PointerKind kind, T7BlockAddress target) in zone.PointersIn(start, size))
++            {
++                if (kind is not (T7PointerKind.Packed or T7PointerKind.PackedAlias))
++                    continue;
++                int other = ReferencedAsset(zone, field, target);
++                if (other >= 0 && other != asset.Index && seen.Add(other))
++                    yield return other;
++            }
++        }
++    }
++
++    private static bool IsShaderSet(int type) => type is T7AssetTypes.TechniqueSet or T7AssetTypes.ComputeShaderSet;
++
++    // Size of the assets a copy of `asset` must carry along, or -1 when that pulls in anything but shader sets
++    // (a weapon or material that happens to hold the shared data drags whole animation sets with it).
++    private int CarryCost(T7WalkIndex zone, T7Walk.Asset asset, int limit = 64)
++    {
++        var seen = new HashSet<int> { asset.Index };
++        var queue = new Queue<T7Walk.Asset>([asset]);
++        while (queue.Count > 0)
++        {
++            foreach (int other in Dependencies(zone, queue.Dequeue()))
++            {
++                if (!seen.Add(other))
++                    continue;
++                T7Walk.Asset dependency = zone.Walk.Assets[other];
++                if (!IsShaderSet(dependency.Type) || seen.Count > limit)
++                    return -1;
++                queue.Enqueue(dependency);
++            }
++        }
++        return seen.Count - 1;
++    }
++
++    // Like TryFind, for a shader set that will be copied into the output: prefer the copy with the fewest shared
++    // shader sets to carry, walking a few more zones that have the name when the loaded copies drag in other assets.
++    public bool TryFindForCopy(int type, string name, out T7WalkIndex? zone, out T7Walk.Asset? asset, int extraZones = 16) =>
++        TryFindForCopy(type, name, out zone, out asset, out _, extraZones);
++
++    // `clean`: the copy found carries only shader sets along (false: it points into a model or other asset).
++    public bool TryFindForCopy(int type, string name, out T7WalkIndex? zone, out T7Walk.Asset? asset, out bool clean, int extraZones = 16)
++    {
++        clean = false;
++        if (!TryFind(type, name, out zone, out asset))
++            return false;
++        (T7WalkIndex Zone, T7Walk.Asset Asset)? best = null;
++        int bestCost = int.MaxValue;
++        void Consider()
++        {
++            foreach (var c in _assets[(type, name)])
++            {
++                int cost = CarryCost(c.Zone, c.Asset);
++                if (cost >= 0 && (cost < bestCost || (cost == bestCost && string.Equals(c.Zone.Label, PreferredZone, StringComparison.OrdinalIgnoreCase))))
++                {
++                    best = c;
++                    bestCost = cost;
++                }
++            }
++        }
++        Consider();
++        if (best == null && _catalog.TryGetValue(name, out List<string>? files))
++        {
++            foreach (string file in files.Where(f => !_walkedFiles.Contains(f)).Take(extraZones).ToList())
++            {
++                WalkFile(file);
++                Consider();
++                if (best != null)
++                    break;
++            }
++        }
++        if (best == null)
++        {
++            _log($"donor {name}: every loaded PS4 copy drags in non-shader assets; using {zone!.Label}");
++            return true;
++        }
++        zone = best.Value.Zone;
++        asset = best.Value.Asset;
++        clean = true;
++        return true;
++    }
++
++    private readonly Dictionary<(T7WalkIndex Zone, int Asset), bool> _selfContained = [];
++
++    private bool SelfContained(T7WalkIndex zone, T7Walk.Asset asset)
++    {
++        if (_selfContained.TryGetValue((zone, asset.Index), out bool known))
++            return known;
++        bool contained = true;
++        var spans = new List<(long Start, long Size)> { (asset.Start, asset.End - asset.Start) };
++        spans.AddRange(asset.Deferred.Select(d => (d.FileOffset, d.Size)));
++        foreach ((long start, long size) in spans)
++        {
++            foreach ((long field, T7PointerKind kind, T7BlockAddress target) in zone.PointersIn(start, size))
++            {
++                if (kind is not (T7PointerKind.Packed or T7PointerKind.PackedAlias))
++                    continue;
++                int other = ReferencedAsset(zone, field, target);
++                if (other >= 0 && other != asset.Index)
++                    contained = false;
++                if (!contained)
++                    break;
++            }
++            if (!contained)
++                break;
++        }
++        _selfContained[(zone, asset.Index)] = contained;
++        return contained;
++    }
++}
+--- a/Tool/src/FFPorter.Core.T7/Port/T7Fidelity.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/T7Fidelity.cs
+@@ -26,6 +26,8 @@
+         (n, _) => $"{N(n, "technique set", "technique sets")} {Were(n)} compiled for PS4 from {Use(n, "its", "their")} PC shaders (DXBC to PSSL)");
+     public static readonly T7Issue TechniqueSetDonor = new("techset.donor", Materials, Strong,
+         (n, _) => $"{N(n, "technique set", "technique sets")} came from the PS4 reference zones");
++    public static readonly T7Issue TechniqueSetSubstitute = new("techset.substitute", Materials, Approximate,
++        (n, s) => $"{N(n, "technique set", "technique sets")} had no PS4 equivalent and {Use(n, "uses", "use")} the nearest PS4 technique set instead, so {Use(n, "its", "their")} surfaces may look different{Example(s)}");
+     public static readonly T7Issue VertexUsageUnknown = new("techset.vertex-usage", Materials, Approximate,
+         (n, s) => $"{N(n, "technique set", "technique sets")} {Use(n, "uses", "use")} vertex streams with no known PS4 meaning, kept in PC order{Example(s)}");
+     public static readonly T7Issue DupMaterialsLeftOut = new("material.dup", Materials, null,
+--- a/Tool/src/FFPorter.Core.T7/Port/T7AssetPlan.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/T7AssetPlan.cs
+@@ -1,313 +1,333 @@
+-using FFPorter.Core.T7.Harness;
+-using FFPorter.Core.T7.Link;
+-
+-namespace FFPorter.Core.T7.Port;
+-
+-public sealed class T7PortContext
+-{
+-    public required T7WalkIndex Pc { get; init; }
+-    public required T7ZoneBuilder Builder { get; init; }
+-    public required T7DonorLibrary Donors { get; init; }
+-    public required Action<string> Log { get; init; }
+-
+-    public int[] OutputIndexOfPc { get; init; } = [];
+-
+-    public Streams.T7StreamMap Streams { get; } = new();
+-
+-    public IReadOnlyDictionary<string, string> SoundRenames { get; init; } = new Dictionary<string, string>();
+-
+-    public T7PcShaderLibrary? ShaderLibrary { get; set; }
+-
+-    public Shaders.T7ShaderCompiler? ShaderCompiler { get; set; }
+-
+-    private Dictionary<string, long>? _imageStructs;
+-
+-    public byte[]? ImageStructByName(string name)
+-    {
+-        if (_imageStructs == null)
+-        {
+-            _imageStructs = new Dictionary<string, long>(StringComparer.Ordinal);
+-            foreach (T7Walk.Asset asset in Pc.Walk.Assets)
+-            {
+-                foreach (T7Walk.Registration registration in asset.Registrations)
+-                {
+-                    if (registration.Type != T7AssetTypes.Image || _imageStructs.ContainsKey(registration.Name))
+-                        continue;
+-                    for (int i = asset.Reads.Count - 1; i >= 0; i--)
+-                    {
+-                        T7Walk.Span read = asset.Reads[i];
+-                        if (read.FileOffset >= registration.FilePos)
+-                            continue;
+-                        if (read.Kind == T7WalkKind.Read && read.Size == 264 && read.At == registration.Header)
+-                        {
+-                            _imageStructs[registration.Name] = read.FileOffset;
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-        return _imageStructs.TryGetValue(name, out long at) ? Pc.Zone.AsSpan((int)at, 264).ToArray() : null;
+-    }
+-
+-    public Scripts.T7Gsc? Gsc { get; set; }
+-
+-    public Scripts.T7GscBuiltins? GscBuiltins { get; set; }
+-
+-    public string? Acts { get; set; }
+-
+-    public bool GscRecompile { get; set; }
+-
+-    public Dictionary<string, int> StringPools { get; } = new(StringComparer.Ordinal);
+-
+-    public List<T7TextureComboFallout> Fallouts { get; } = [];
+-
+-    public T7TextureComboFallout? FalloutOf(long field) => Fallouts.Find(f => f.RehomeFields.ContainsKey(field) || f.InlineCopyFields.Contains(field) || f.NullFields.Contains(field));
+-
+-    public IReadOnlyList<IT7AssetConverter> Converters { get; set; } = [];
+-
+-    public IT7NestedConverter? NestedConverter(int type) => Converters.OfType<IT7NestedConverter>().FirstOrDefault(c => c.CanConvertNested(type));
+-
+-    public List<string> Warnings { get; } = [];
+-
+-    public T7Fidelity? Fidelity { get; set; }
+-
+-    public void Warn(T7Issue issue, string warning, string? sample = null)
+-    {
+-        Warnings.Add(warning);
+-        Fidelity?.Raise(issue, sample);
+-    }
+-
+-    public ulong Ps4StreamKey(ulong pcKey, out Streams.T7StreamMap.Item? item, Common.Fidelity.FidelityDimension part = Common.Fidelity.FidelityDimension.Textures)
+-    {
+-        if (Streams.TryGet(pcKey, out item))
+-            return item.Ps4Key;
+-        if (_unknownKeys.Add(pcKey))
+-            Warn(T7Issues.StreamKeyUnknown(part), $"stream key {pcKey:x16} is in no converted xpak or PS4 index; the PC key is kept");
+-        item = null;
+-        return pcKey;
+-    }
+-
+-    private readonly HashSet<ulong> _unknownKeys = [];
+-}
+-
+-public interface IT7AssetConverter
+-{
+-    string Name { get; }
+-
+-    bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason);
+-}
+-
+-public interface IT7StreamPlanner
+-{
+-    void PlanStreams(T7PortContext context, T7Walk.Asset asset, Streams.T7StreamPlan plan);
+-}
+-
+-public interface IT7NestedConverter
+-{
+-    bool CanConvertNested(int type);
+-
+-    bool TryConvertNested(T7PortContext context, T7AssetRewrite rewrite, int type, int endRead, out string? reason);
+-}
+-
+-public sealed class T7CopyConverter : IT7AssetConverter
+-{
+-    public static readonly HashSet<int> LoaderCheckedTypes =
+-    [
+-        T7AssetTypes.StreamerHint, T7AssetTypes.Bitfield, T7AssetTypes.CustomizationTableColor, T7AssetTypes.MapTable, T7AssetTypes.LeaderboardDef,
+-        T7AssetTypes.MedalTable, T7AssetTypes.Medal, T7AssetTypes.ScriptBundleList, T7AssetTypes.VehicleFxDef, T7AssetTypes.CgMediaTable,
+-        T7AssetTypes.ObjectiveList, T7AssetTypes.LocDmgTable, T7AssetTypes.MapTableLoadingImages, T7AssetTypes.Ddl, T7AssetTypes.FlameTable,
+-        T7AssetTypes.BehaviorStateMachine, T7AssetTypes.BulletPenetration, T7AssetTypes.CustomizationTableFeImages, T7AssetTypes.LightDef,
+-        T7AssetTypes.StructuredTable, T7AssetTypes.FontIcon, T7AssetTypes.SndDriverGlobals, T7AssetTypes.SoundPatch,
+-    ];
+-
+-    public static readonly HashSet<int> IdenticalTypes =
+-    [
+-        T7AssetTypes.PhysPreset, T7AssetTypes.PhysConstraints, T7AssetTypes.DestructibleDef, T7AssetTypes.XAnimParts,
+-        T7AssetTypes.ClipMap, T7AssetTypes.ComWorld, T7AssetTypes.GameWorld, T7AssetTypes.MapEnts, T7AssetTypes.Glasses,
+-        T7AssetTypes.ImpactSound, T7AssetTypes.AiType, T7AssetTypes.Character, T7AssetTypes.RawFile, T7AssetTypes.StringTable,
+-        T7AssetTypes.KeyValuePairs, T7AssetTypes.SurfaceFxTable, T7AssetTypes.SurfaceSoundDef, T7AssetTypes.FootstepTable,
+-        T7AssetTypes.EntitySoundImpacts, T7AssetTypes.ScriptBundle, T7AssetTypes.AnimMappingTable, T7AssetTypes.XCam,
+-        T7AssetTypes.BgCache, T7AssetTypes.AttachmentCosmeticVariant, T7AssetTypes.SharedWeaponSounds,
+-        T7AssetTypes.ZBarrier, T7AssetTypes.XModelAlias, T7AssetTypes.AimTable,
+-        T7AssetTypes.Attachment, T7AssetTypes.AttachmentUnique, T7AssetTypes.WeaponCamo, T7AssetTypes.Rumble, T7AssetTypes.Tracer,
+-        T7AssetTypes.ImpactFx, T7AssetTypes.EntityFxImpacts, T7AssetTypes.TagFx, T7AssetTypes.Laser, T7AssetTypes.Shellshock,
+-        T7AssetTypes.Beam, T7AssetTypes.Objective, T7AssetTypes.Ttf,
+-        T7AssetTypes.Localize, T7AssetTypes.Vehicle,
+-        T7AssetTypes.VehicleSoundDef, T7AssetTypes.PlayerSoundsTable, T7AssetTypes.PlayerFxTable, T7AssetTypes.CustomizationTable,
+-        .. LoaderCheckedTypes,
+-    ];
+-
+-
+-    public string Name => "copy";
+-
+-    public bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason)
+-    {
+-        reason = null;
+-        if (!IdenticalTypes.Contains(asset.Type) || HasConvertedSubAssets(asset))
+-            return false;
+-        CopyWhole(context.Pc, asset, output);
+-        return true;
+-    }
+-
+-    public static bool HasConvertedSubAssets(T7Walk.Asset asset)
+-    {
+-        for (int r = 0; r < asset.Registrations.Count - 1; r++)
+-        {
+-            if (!IdenticalTypes.Contains(asset.Registrations[r].Type))
+-                return true;
+-        }
+-        return false;
+-    }
+-
+-    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> NestedSpans(T7Walk.Asset asset) =>
+-        Outermost(AllSpans(asset), 0, asset.Reads.Count, -1);
+-
+-    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> AllSpans(T7Walk.Asset asset)
+-    {
+-        var spans = new List<(int First, int End, T7Walk.Registration Registration, int Index)>();
+-        for (int r = 0; r < asset.Registrations.Count - 1; r++)
+-        {
+-            T7Walk.Registration registration = asset.Registrations[r];
+-            int end = asset.Reads.FindIndex(read => read.FileOffset >= registration.FilePos);
+-            if (end < 0)
+-                end = asset.Reads.Count;
+-            int first = -1;
+-            for (int i = end - 1; i >= 0; i--)
+-            {
+-                if (asset.Reads[i].Kind == T7WalkKind.Read && asset.Reads[i].At == registration.Header)
+-                {
+-                    first = i;
+-                    break;
+-                }
+-            }
+-            if (first >= 0)
+-                spans.Add((first, end, registration, r));
+-        }
+-        spans.Sort((a, b) => a.First != b.First ? a.First.CompareTo(b.First) : b.End.CompareTo(a.End));
+-        return spans;
+-    }
+-
+-    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> Outermost(
+-        List<(int First, int End, T7Walk.Registration Registration, int Index)> spans, int first, int end, int except)
+-    {
+-        var outer = new List<(int First, int End, T7Walk.Registration Registration, int Index)>();
+-        foreach (var span in spans)
+-        {
+-            if (span.Index == except || span.First < first || span.End > end)
+-                continue;
+-            if (outer.Count > 0 && span.First < outer[^1].End)
+-                continue;
+-            outer.Add(span);
+-        }
+-        return outer;
+-    }
+-
+-    public static List<T7Walk.Span> OwnReads(T7Walk.Asset asset)
+-    {
+-        var converted = AllSpans(asset).Where(s => !IdenticalTypes.Contains(s.Registration.Type)).ToList();
+-        var reads = new List<T7Walk.Span>(asset.Reads.Count);
+-        for (int i = 0; i < asset.Reads.Count; i++)
+-        {
+-            if (!converted.Any(s => i >= s.First && i < s.End))
+-                reads.Add(asset.Reads[i]);
+-        }
+-        return reads;
+-    }
+-
+-    public static void CopyWhole(T7WalkIndex source, T7Walk.Asset asset, T7OutputAsset output)
+-    {
+-        if (asset.End > asset.Start)
+-            output.Main.Add(new T7CopyPiece(source, asset.Start, asset.End - asset.Start));
+-        foreach (T7Walk.Span span in asset.Deferred)
+-            output.Deferred.Add(new T7CopyPiece(source, span.FileOffset, span.Size));
+-    }
+-}
+-
+-public sealed class T7DonorConverter : IT7AssetConverter
+-{
+-    private readonly HashSet<int> _types;
+-
+-    public T7DonorConverter(IEnumerable<int> types) => _types = [.. types];
+-
+-    public string Name => "donor";
+-
+-    public bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason)
+-    {
+-        reason = null;
+-        if (!_types.Contains(asset.Type))
+-            return false;
+-        string? name = asset.Name;
+-        if (string.IsNullOrEmpty(name))
+-        {
+-            reason = "asset has no name";
+-            return false;
+-        }
+-        if (!context.Donors.TryFind(asset.Type, T7Names.ToPs4(asset.Type, name), out T7WalkIndex? donor, out T7Walk.Asset? donorAsset))
+-        {
+-            reason = $"no PS4 donor {T7AssetTypes.Name(asset.Type)} '{T7Names.ToPs4(asset.Type, name)}'";
+-            return false;
+-        }
+-        T7CopyConverter.CopyWhole(donor!, donorAsset!, output);
+-        output.Origin = $"donor {donor!.Label}#{donorAsset!.Index}";
+-        context.Builder.MapAsset(donor, donorAsset.Index, context.OutputIndexOfPc[asset.Index]);
+-        AlignReads(context.Builder, context.Pc, asset, donor, donorAsset);
+-        foreach (T7TextureComboFallout fallout in context.Fallouts)
+-        {
+-            foreach ((long field, T7TextureComboFallout.SubAsset subAsset) in fallout.RehomeFields)
+-            {
+-                if (field >= asset.Start && field < asset.End)
+-                    fallout.Claim(subAsset);
+-            }
+-        }
+-        return true;
+-    }
+-
+-    public static void AlignReads(T7ZoneBuilder builder, T7WalkIndex from, T7Walk.Asset fromAsset, T7WalkIndex to, T7Walk.Asset toAsset)
+-    {
+-        List<T7Walk.Span> a = fromAsset.Reads, b = toAsset.Reads;
+-        if (a.Count == 0 || b.Count == 0 || (long)a.Count * b.Count > 25_000_000)
+-            return;
+-        var lengths = new int[a.Count + 1, b.Count + 1];
+-        for (int i = a.Count - 1; i >= 0; i--)
+-            for (int j = b.Count - 1; j >= 0; j--)
+-                lengths[i, j] = a[i].Kind == b[j].Kind && a[i].Size == b[j].Size ? lengths[i + 1, j + 1] + 1 : Math.Max(lengths[i + 1, j], lengths[i, j + 1]);
+-        for (int i = 0, j = 0; i < a.Count && j < b.Count;)
+-        {
+-            if (a[i].Kind == b[j].Kind && a[i].Size == b[j].Size)
+-            {
+-                builder.MapEquivalent(from, a[i].FileOffset, a[i].Size, to, b[j].FileOffset);
+-                i++;
+-                j++;
+-            }
+-            else if (lengths[i + 1, j] >= lengths[i, j + 1])
+-            {
+-                i++;
+-            }
+-            else
+-            {
+-                j++;
+-            }
+-        }
+-    }
+-}
+-
+-public static class T7Names
+-{
+-    public const uint TechsetPlatformDelta = 0x01473F41;
+-
+-    public static string ToPs4(int type, string name)
+-    {
+-        if (type is T7AssetTypes.TechniqueSet or T7AssetTypes.ComputeShaderSet && TrySplitHash(name, out string stem, out uint hash))
+-            return $"{stem}#{unchecked(hash - TechsetPlatformDelta):x8}";
+-        return name;
+-    }
+-
+-    private static bool TrySplitHash(string name, out string stem, out uint hash)
+-    {
+-        int at = name.LastIndexOf('#');
+-        stem = at > 0 ? name[..at] : name;
+-        hash = 0;
+-        return at > 0 && name.Length - at == 9 && uint.TryParse(name.AsSpan(at + 1), System.Globalization.NumberStyles.HexNumber, null, out hash);
+-    }
+-}
++using FFPorter.Core.T7.Harness;
++using FFPorter.Core.T7.Link;
++
++namespace FFPorter.Core.T7.Port;
++
++public sealed class T7PortContext
++{
++    public required T7WalkIndex Pc { get; init; }
++    public required T7ZoneBuilder Builder { get; init; }
++    public required T7DonorLibrary Donors { get; init; }
++    public required Action<string> Log { get; init; }
++
++    public int[] OutputIndexOfPc { get; init; } = [];
++
++    public Streams.T7StreamMap Streams { get; } = new();
++
++    public IReadOnlyDictionary<string, string> SoundRenames { get; init; } = new Dictionary<string, string>();
++
++    public T7PcShaderLibrary? ShaderLibrary { get; set; }
++
++    public Shaders.T7ShaderCompiler? ShaderCompiler { get; set; }
++
++    private Dictionary<string, long>? _imageStructs;
++
++    public byte[]? ImageStructByName(string name)
++    {
++        if (_imageStructs == null)
++        {
++            _imageStructs = new Dictionary<string, long>(StringComparer.Ordinal);
++            foreach (T7Walk.Asset asset in Pc.Walk.Assets)
++            {
++                foreach (T7Walk.Registration registration in asset.Registrations)
++                {
++                    if (registration.Type != T7AssetTypes.Image || _imageStructs.ContainsKey(registration.Name))
++                        continue;
++                    for (int i = asset.Reads.Count - 1; i >= 0; i--)
++                    {
++                        T7Walk.Span read = asset.Reads[i];
++                        if (read.FileOffset >= registration.FilePos)
++                            continue;
++                        if (read.Kind == T7WalkKind.Read && read.Size == 264 && read.At == registration.Header)
++                        {
++                            _imageStructs[registration.Name] = read.FileOffset;
++                            break;
++                        }
++                    }
++                }
++            }
++        }
++        return _imageStructs.TryGetValue(name, out long at) ? Pc.Zone.AsSpan((int)at, 264).ToArray() : null;
++    }
++
++    public Scripts.T7Gsc? Gsc { get; set; }
++
++    public Scripts.T7GscBuiltins? GscBuiltins { get; set; }
++
++    public string? Acts { get; set; }
++
++    public bool GscRecompile { get; set; }
++
++    public Dictionary<string, int> StringPools { get; } = new(StringComparer.Ordinal);
++
++    public List<T7TextureComboFallout> Fallouts { get; } = [];
++
++    // Donor technique sets copied inline into a converted asset (a material's embedded technique set): their shared
++    // shader data must be carried along like that of the donor assets.
++    public List<(T7WalkIndex Zone, T7Walk.Asset Asset)> InlineDonors { get; } = [];
++
++    public T7TextureComboFallout? FalloutOf(long field) => Fallouts.Find(f => f.RehomeFields.ContainsKey(field) || f.InlineCopyFields.Contains(field) || f.NullFields.Contains(field));
++
++    public IReadOnlyList<IT7AssetConverter> Converters { get; set; } = [];
++
++    public IT7NestedConverter? NestedConverter(int type) => Converters.OfType<IT7NestedConverter>().FirstOrDefault(c => c.CanConvertNested(type));
++
++    public List<string> Warnings { get; } = [];
++
++    public T7Fidelity? Fidelity { get; set; }
++
++    public void Warn(T7Issue issue, string warning, string? sample = null)
++    {
++        Warnings.Add(warning);
++        Fidelity?.Raise(issue, sample);
++    }
++
++    public ulong Ps4StreamKey(ulong pcKey, out Streams.T7StreamMap.Item? item, Common.Fidelity.FidelityDimension part = Common.Fidelity.FidelityDimension.Textures)
++    {
++        if (Streams.TryGet(pcKey, out item))
++            return item.Ps4Key;
++        if (_unknownKeys.Add(pcKey))
++            Warn(T7Issues.StreamKeyUnknown(part), $"stream key {pcKey:x16} is in no converted xpak or PS4 index; the PC key is kept");
++        item = null;
++        return pcKey;
++    }
++
++    private readonly HashSet<ulong> _unknownKeys = [];
++}
++
++public interface IT7AssetConverter
++{
++    string Name { get; }
++
++    bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason);
++}
++
++public interface IT7StreamPlanner
++{
++    void PlanStreams(T7PortContext context, T7Walk.Asset asset, Streams.T7StreamPlan plan);
++}
++
++public interface IT7NestedConverter
++{
++    bool CanConvertNested(int type);
++
++    bool TryConvertNested(T7PortContext context, T7AssetRewrite rewrite, int type, int endRead, out string? reason);
++}
++
++public sealed class T7CopyConverter : IT7AssetConverter
++{
++    public static readonly HashSet<int> LoaderCheckedTypes =
++    [
++        T7AssetTypes.StreamerHint, T7AssetTypes.Bitfield, T7AssetTypes.CustomizationTableColor, T7AssetTypes.MapTable, T7AssetTypes.LeaderboardDef,
++        T7AssetTypes.MedalTable, T7AssetTypes.Medal, T7AssetTypes.ScriptBundleList, T7AssetTypes.VehicleFxDef, T7AssetTypes.CgMediaTable,
++        T7AssetTypes.ObjectiveList, T7AssetTypes.LocDmgTable, T7AssetTypes.MapTableLoadingImages, T7AssetTypes.Ddl, T7AssetTypes.FlameTable,
++        T7AssetTypes.BehaviorStateMachine, T7AssetTypes.BulletPenetration, T7AssetTypes.CustomizationTableFeImages, T7AssetTypes.LightDef,
++        T7AssetTypes.StructuredTable, T7AssetTypes.FontIcon, T7AssetTypes.SndDriverGlobals, T7AssetTypes.SoundPatch,
++    ];
++
++    public static readonly HashSet<int> IdenticalTypes =
++    [
++        T7AssetTypes.PhysPreset, T7AssetTypes.PhysConstraints, T7AssetTypes.DestructibleDef, T7AssetTypes.XAnimParts,
++        T7AssetTypes.ClipMap, T7AssetTypes.ComWorld, T7AssetTypes.GameWorld, T7AssetTypes.MapEnts, T7AssetTypes.Glasses,
++        T7AssetTypes.ImpactSound, T7AssetTypes.AiType, T7AssetTypes.Character, T7AssetTypes.RawFile, T7AssetTypes.StringTable,
++        T7AssetTypes.KeyValuePairs, T7AssetTypes.SurfaceFxTable, T7AssetTypes.SurfaceSoundDef, T7AssetTypes.FootstepTable,
++        T7AssetTypes.EntitySoundImpacts, T7AssetTypes.ScriptBundle, T7AssetTypes.AnimMappingTable, T7AssetTypes.XCam,
++        T7AssetTypes.BgCache, T7AssetTypes.AttachmentCosmeticVariant, T7AssetTypes.SharedWeaponSounds,
++        T7AssetTypes.ZBarrier, T7AssetTypes.XModelAlias, T7AssetTypes.AimTable,
++        T7AssetTypes.Attachment, T7AssetTypes.AttachmentUnique, T7AssetTypes.WeaponCamo, T7AssetTypes.Rumble, T7AssetTypes.Tracer,
++        T7AssetTypes.ImpactFx, T7AssetTypes.EntityFxImpacts, T7AssetTypes.TagFx, T7AssetTypes.Laser, T7AssetTypes.Shellshock,
++        T7AssetTypes.Beam, T7AssetTypes.Objective, T7AssetTypes.Ttf,
++        T7AssetTypes.Localize, T7AssetTypes.Vehicle,
++        T7AssetTypes.VehicleSoundDef, T7AssetTypes.PlayerSoundsTable, T7AssetTypes.PlayerFxTable, T7AssetTypes.CustomizationTable,
++        .. LoaderCheckedTypes,
++    ];
++
++
++    public string Name => "copy";
++
++    public bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason)
++    {
++        reason = null;
++        if (!IdenticalTypes.Contains(asset.Type) || HasConvertedSubAssets(asset))
++            return false;
++        CopyWhole(context.Pc, asset, output);
++        return true;
++    }
++
++    public static bool HasConvertedSubAssets(T7Walk.Asset asset)
++    {
++        for (int r = 0; r < asset.Registrations.Count - 1; r++)
++        {
++            if (!IdenticalTypes.Contains(asset.Registrations[r].Type))
++                return true;
++        }
++        return false;
++    }
++
++    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> NestedSpans(T7Walk.Asset asset) =>
++        Outermost(AllSpans(asset), 0, asset.Reads.Count, -1);
++
++    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> AllSpans(T7Walk.Asset asset)
++    {
++        var spans = new List<(int First, int End, T7Walk.Registration Registration, int Index)>();
++        for (int r = 0; r < asset.Registrations.Count - 1; r++)
++        {
++            T7Walk.Registration registration = asset.Registrations[r];
++            int end = asset.Reads.FindIndex(read => read.FileOffset >= registration.FilePos);
++            if (end < 0)
++                end = asset.Reads.Count;
++            int first = -1;
++            for (int i = end - 1; i >= 0; i--)
++            {
++                if (asset.Reads[i].Kind == T7WalkKind.Read && asset.Reads[i].At == registration.Header)
++                {
++                    first = i;
++                    break;
++                }
++            }
++            if (first >= 0)
++                spans.Add((first, end, registration, r));
++        }
++        spans.Sort((a, b) => a.First != b.First ? a.First.CompareTo(b.First) : b.End.CompareTo(a.End));
++        return spans;
++    }
++
++    public static List<(int First, int End, T7Walk.Registration Registration, int Index)> Outermost(
++        List<(int First, int End, T7Walk.Registration Registration, int Index)> spans, int first, int end, int except)
++    {
++        var outer = new List<(int First, int End, T7Walk.Registration Registration, int Index)>();
++        foreach (var span in spans)
++        {
++            if (span.Index == except || span.First < first || span.End > end)
++                continue;
++            if (outer.Count > 0 && span.First < outer[^1].End)
++                continue;
++            outer.Add(span);
++        }
++        return outer;
++    }
++
++    public static List<T7Walk.Span> OwnReads(T7Walk.Asset asset)
++    {
++        var converted = AllSpans(asset).Where(s => !IdenticalTypes.Contains(s.Registration.Type)).ToList();
++        var reads = new List<T7Walk.Span>(asset.Reads.Count);
++        for (int i = 0; i < asset.Reads.Count; i++)
++        {
++            if (!converted.Any(s => i >= s.First && i < s.End))
++                reads.Add(asset.Reads[i]);
++        }
++        return reads;
++    }
++
++    public static void CopyWhole(T7WalkIndex source, T7Walk.Asset asset, T7OutputAsset output)
++    {
++        if (asset.End > asset.Start)
++            output.Main.Add(new T7CopyPiece(source, asset.Start, asset.End - asset.Start));
++        foreach (T7Walk.Span span in asset.Deferred)
++            output.Deferred.Add(new T7CopyPiece(source, span.FileOffset, span.Size));
++    }
++}
++
++public sealed class T7DonorConverter : IT7AssetConverter
++{
++    private readonly HashSet<int> _types;
++
++    public T7DonorConverter(IEnumerable<int> types) => _types = [.. types];
++
++    public string Name => "donor";
++
++    public bool TryConvert(T7PortContext context, T7Walk.Asset asset, T7OutputAsset output, out string? reason)
++    {
++        reason = null;
++        if (!_types.Contains(asset.Type))
++            return false;
++        string? name = asset.Name;
++        if (string.IsNullOrEmpty(name))
++        {
++            reason = "asset has no name";
++            return false;
++        }
++        string wanted = T7Names.ToPs4(asset.Type, name);
++        bool shaderSet = asset.Type is T7AssetTypes.TechniqueSet or T7AssetTypes.ComputeShaderSet;
++        bool found = context.Donors.TryFindForCopy(asset.Type, wanted, out T7WalkIndex? donor, out T7Walk.Asset? donorAsset, out bool clean);
++        if (shaderSet && (!found || !clean))
++        {
++            // Technique sets the retail PS4 game never shipped (DLC-only, or built by the mod tools), or whose every
++            // PS4 copy shares its shader programs with a model: without a PS4 shader compiler, the nearest PS4
++            // technique set of the same family that can be carried whole draws the surface instead.
++            string? nearest = context.Donors.NearestClean(asset.Type, wanted) ?? (found ? null : context.Donors.Nearest(asset.Type, wanted));
++            if (nearest != null && context.Donors.TryFindForCopy(asset.Type, nearest, out T7WalkIndex? other, out T7Walk.Asset? otherAsset))
++            {
++                (donor, donorAsset, found) = (other, otherAsset, true);
++                context.Warn(T7Issues.TechniqueSetSubstitute, $"techset '{name}': {(clean ? "no" : "no whole")} PS4 '{wanted}'; using nearest PS4 '{nearest}' ({donor!.Label}){T7DonorLibrary.AddedFeatures(wanted, nearest)}",
++                    $"{name} -> {nearest}");
++            }
++        }
++        if (!found)
++        {
++            reason = $"no PS4 donor {T7AssetTypes.Name(asset.Type)} '{wanted}'";
++            return false;
++        }
++        T7CopyConverter.CopyWhole(donor!, donorAsset!, output);
++        output.Origin = $"donor {donor!.Label}#{donorAsset!.Index}";
++        context.Builder.MapAsset(donor, donorAsset.Index, context.OutputIndexOfPc[asset.Index]);
++        AlignReads(context.Builder, context.Pc, asset, donor, donorAsset);
++        foreach (T7TextureComboFallout fallout in context.Fallouts)
++        {
++            foreach ((long field, T7TextureComboFallout.SubAsset subAsset) in fallout.RehomeFields)
++            {
++                if (field >= asset.Start && field < asset.End)
++                    fallout.Claim(subAsset);
++            }
++        }
++        return true;
++    }
++
++    public static void AlignReads(T7ZoneBuilder builder, T7WalkIndex from, T7Walk.Asset fromAsset, T7WalkIndex to, T7Walk.Asset toAsset)
++    {
++        List<T7Walk.Span> a = fromAsset.Reads, b = toAsset.Reads;
++        if (a.Count == 0 || b.Count == 0 || (long)a.Count * b.Count > 25_000_000)
++            return;
++        var lengths = new int[a.Count + 1, b.Count + 1];
++        for (int i = a.Count - 1; i >= 0; i--)
++            for (int j = b.Count - 1; j >= 0; j--)
++                lengths[i, j] = a[i].Kind == b[j].Kind && a[i].Size == b[j].Size ? lengths[i + 1, j + 1] + 1 : Math.Max(lengths[i + 1, j], lengths[i, j + 1]);
++        for (int i = 0, j = 0; i < a.Count && j < b.Count;)
++        {
++            if (a[i].Kind == b[j].Kind && a[i].Size == b[j].Size)
++            {
++                builder.MapEquivalent(from, a[i].FileOffset, a[i].Size, to, b[j].FileOffset);
++                i++;
++                j++;
++            }
++            else if (lengths[i + 1, j] >= lengths[i, j + 1])
++            {
++                i++;
++            }
++            else
++            {
++                j++;
++            }
++        }
++    }
++}
++
++public static class T7Names
++{
++    public const uint TechsetPlatformDelta = 0x01473F41;
++
++    public static string ToPs4(int type, string name)
++    {
++        if (type is T7AssetTypes.TechniqueSet or T7AssetTypes.ComputeShaderSet && TrySplitHash(name, out string stem, out uint hash))
++            return $"{stem}#{unchecked(hash - TechsetPlatformDelta):x8}";
++        return name;
++    }
++
++    private static bool TrySplitHash(string name, out string stem, out uint hash)
++    {
++        int at = name.LastIndexOf('#');
++        stem = at > 0 ? name[..at] : name;
++        hash = 0;
++        return at > 0 && name.Length - at == 9 && uint.TryParse(name.AsSpan(at + 1), System.Globalization.NumberStyles.HexNumber, null, out hash);
++    }
++}
+--- a/Tool/src/FFPorter.Core.T7/Port/Converters/T7MaterialConverter.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/Converters/T7MaterialConverter.cs
+@@ -342,8 +342,21 @@
+         if (techset == null)
+             throw new InvalidDataException($"{rewrite.Label}: embedded technique set has no name");
+         string ps4 = T7Names.ToPs4(T7AssetTypes.TechniqueSet, techset);
+-        if (!context.Donors.TryFind(T7AssetTypes.TechniqueSet, ps4, out T7WalkIndex? donor, out T7Walk.Asset? donorAsset))
++        bool found = context.Donors.TryFindForCopy(T7AssetTypes.TechniqueSet, ps4, out T7WalkIndex? donor, out T7Walk.Asset? donorAsset, out bool clean);
++        if (!found || !clean)
++        {
++            // As for donor assets: the nearest technique set with a copy that can be carried whole (dropping features only).
++            string? nearest = context.Donors.NearestClean(T7AssetTypes.TechniqueSet, ps4) ?? (found ? null : context.Donors.Nearest(T7AssetTypes.TechniqueSet, ps4));
++            if (nearest != null && context.Donors.TryFindForCopy(T7AssetTypes.TechniqueSet, nearest, out T7WalkIndex? other, out T7Walk.Asset? otherAsset))
++            {
++                (donor, donorAsset, found) = (other, otherAsset, true);
++                context.Warn(T7Issues.TechniqueSetSubstitute, $"techset '{techset}' (embedded): {(clean ? "no" : "no whole")} PS4 '{ps4}'; using nearest PS4 '{nearest}' ({donor!.Label}){T7DonorLibrary.AddedFeatures(ps4, nearest)}",
++                    $"{techset} -> {nearest}");
++            }
++        }
++        if (!found)
+             throw new InvalidDataException($"{rewrite.Label}: embedded technique set '{ps4}' has shaders and no PS4 reference zone provides it");
++        context.InlineDonors.Add((donor!, donorAsset!));
+         T7Walk.Registration? registration = null;
+         foreach (T7Walk.Registration candidate in rewrite.Asset.Registrations)
+         {
+--- a/Tool/src/FFPorter.Core.T7/Port/Converters/T7MiscConverter.cs
++++ b/Tool/src/FFPorter.Core.T7/Port/Converters/T7MiscConverter.cs
+@@ -74,6 +74,14 @@
+         uint length = BinaryPrimitives.ReadUInt32LittleEndian(rewrite.Pc.Zone.AsSpan((int)header.FileOffset + 8));
+         if (bufferRead.Size != length + 1L)
+             throw new InvalidDataException($"{rewrite.Label}: script buffer is {bufferRead.Size} bytes, its header says {length}+1");
++        string? dump = Environment.GetEnvironmentVariable("FFPORTER_DUMP_GSC");
++        if (!string.IsNullOrEmpty(dump))
++        {
++            // Debugging: every PC script as the mod tools compiled it, for comparing decoders.
++            string file = Path.Combine(dump, (rewrite.Asset.Name ?? "script").Replace('/', '_').Replace('\\', '_') + "c");
++            Directory.CreateDirectory(dump);
++            File.WriteAllBytes(file, rewrite.Bytes(bufferRead)[..(int)length].ToArray());
++        }
+         byte[] converted = gsc.Convert(rewrite.Bytes(bufferRead)[..(int)length]);
+         if (context.GscBuiltins != null)
+         {
+--- a/Tool/src/FFPorter.Core.T7/Link/T7ZoneBuilder.cs
++++ b/Tool/src/FFPorter.Core.T7/Link/T7ZoneBuilder.cs
+@@ -1,405 +1,413 @@
+-using System.Buffers.Binary;
+-using System.Text;
+-using FFPorter.Core.T7.Harness;
+-
+-namespace FFPorter.Core.T7.Link;
+-
+-public abstract record T7Target;
+-
+-public sealed record T7SourceTarget(T7WalkIndex Source, T7BlockAddress Address, long ReferencingFileOffset) : T7Target;
+-
+-public sealed record T7AliasTarget(int OutputAsset, int Slot = 0) : T7Target;
+-
+-public sealed record T7OutputTarget(long OutputFileOffset) : T7Target;
+-
+-public sealed record T7SourceFileTarget(T7WalkIndex Source, long FileOffset) : T7Target;
+-
+-public sealed record T7PoolTarget(string Key) : T7Target;
+-
+-public readonly record struct T7Fixup(long Offset, T7Target Target);
+-
+-public abstract record T7Piece
+-{
+-    public abstract long Length { get; }
+-}
+-
+-public sealed record T7CopyPiece(T7WalkIndex Source, long FileOffset, long Size) : T7Piece
+-{
+-    public override long Length => Size;
+-}
+-
+-public readonly record struct T7PieceSpan(long SourceOffset, long Size, long PieceOffset);
+-
+-public sealed record T7DataPiece(byte[] Data, IReadOnlyList<T7Fixup> Fixups, T7WalkIndex? Source = null, IReadOnlyList<T7PieceSpan>? Spans = null) : T7Piece
+-{
+-    public override long Length => Data.Length;
+-
+-    public IReadOnlyList<(string Key, long Offset)>? Pools { get; init; }
+-}
+-
+-public sealed class T7OutputAsset
+-{
+-    public int Type;
+-    public ulong HeaderMarker = ulong.MaxValue;
+-    public T7Target? HeaderTarget;
+-    public readonly List<T7Piece> Main = [];
+-    public readonly List<T7Piece> Deferred = [];
+-    public string? Name;
+-    public string Origin = "";
+-}
+-
+-public sealed class T7ZoneBuilder
+-{
+-    public const ulong Placeholder = 0x5000000000000001;
+-
+-    public List<string?> ScriptStrings { get; } = [];
+-    public List<T7OutputAsset> Assets { get; } = [];
+-
+-    private readonly List<(long Field, T7Target Target)> _fixups = [];
+-    private readonly Dictionary<T7WalkIndex, List<(long Source, long Size, long Output)>> _spans = [];
+-    private readonly Dictionary<(T7WalkIndex, int), int> _assetMap = [];
+-    private readonly Dictionary<(T7WalkIndex, int, int), (int Asset, int Slot)> _slotMap = [];
+-
+-    public IReadOnlyList<(long Field, T7Target Target)> Fixups => _fixups;
+-
+-    public HashSet<(T7WalkIndex Source, long Field)> NullFields { get; } = [];
+-
+-    public void MapAsset(T7WalkIndex source, int sourceAsset, int outputAsset) => _assetMap[(source, sourceAsset)] = outputAsset;
+-
+-    private readonly Dictionary<T7WalkIndex, IReadOnlyList<int>> _stringMaps = [];
+-
+-    public void MapScriptStrings(T7WalkIndex source, IReadOnlyList<int> outputIndexOfSourceString) => _stringMaps[source] = outputIndexOfSourceString;
+-
+-    public int AddScriptString(string? text)
+-    {
+-        if (text != null)
+-        {
+-            if (_stringIndex.TryGetValue(text, out int existing))
+-                return existing;
+-            _stringIndex[text] = ScriptStrings.Count;
+-        }
+-        ScriptStrings.Add(text);
+-        return ScriptStrings.Count - 1;
+-    }
+-
+-    private readonly Dictionary<string, int> _stringIndex = new(StringComparer.Ordinal);
+-
+-    public void MapSpan(T7WalkIndex source, long sourceOffset, long size, long outputOffset)
+-    {
+-        if (!_spans.TryGetValue(source, out var list))
+-            _spans[source] = list = [];
+-        list.Add((sourceOffset, size, outputOffset));
+-    }
+-
+-    private readonly Dictionary<string, long> _pools = new(StringComparer.Ordinal);
+-
+-    public byte[] Layout()
+-    {
+-        _fixups.Clear();
+-        _spans.Clear();
+-        _pools.Clear();
+-        var output = new MemoryStream();
+-        var writer = new BinaryWriter(output);
+-        writer.Write(ScriptStrings.Count);
+-        writer.Write(0);
+-        writer.Write(ScriptStrings.Count > 0 ? ulong.MaxValue : 0UL);
+-        writer.Write(0);
+-        writer.Write(0);
+-        writer.Write(0UL);
+-        writer.Write(Assets.Count);
+-        writer.Write(0);
+-        writer.Write(Assets.Count > 0 ? ulong.MaxValue : 0UL);
+-        writer.Flush();
+-        long cells = output.Position;
+-        foreach (string? text in ScriptStrings)
+-            writer.Write(text == null ? 0UL : ulong.MaxValue);
+-        var textOffsets = new long[ScriptStrings.Count];
+-        for (int i = 0; i < ScriptStrings.Count; i++)
+-        {
+-            string? text = ScriptStrings[i];
+-            writer.Flush();
+-            textOffsets[i] = text == null ? -1 : output.Position;
+-            if (text != null)
+-            {
+-                writer.Write(Encoding.UTF8.GetBytes(text));
+-                writer.Write((byte)0);
+-            }
+-        }
+-        foreach ((T7WalkIndex source, IReadOnlyList<int> map) in _stringMaps)
+-        {
+-            for (int s = 0; s < map.Count && s < source.List.ScriptStringOffsets.Count; s++)
+-            {
+-                int o = map[s];
+-                if (o < 0)
+-                    continue;
+-                (int cell, int textAt) = source.List.ScriptStringOffsets[s];
+-                MapSpan(source, cell, 8, cells + 8L * o);
+-                if (textAt >= 0 && textOffsets[o] >= 0)
+-                    MapSpan(source, textAt, Encoding.UTF8.GetByteCount(ScriptStrings[o]!) + 1, textOffsets[o]);
+-            }
+-        }
+-        writer.Flush();
+-        long table = output.Position;
+-        foreach (((T7WalkIndex source, int sourceAsset), int outputAsset) in _assetMap)
+-            MapSpan(source, source.List.AssetTableOffset + 16L * sourceAsset, 16, table + 16L * outputAsset);
+-        foreach (T7OutputAsset asset in Assets)
+-        {
+-            writer.Write(asset.Type);
+-            writer.Write(0);
+-            if (asset.HeaderTarget != null)
+-            {
+-                _fixups.Add((output.Position, asset.HeaderTarget));
+-                writer.Write(Placeholder);
+-            }
+-            else
+-            {
+-                writer.Write(asset.HeaderMarker);
+-            }
+-        }
+-        writer.Flush();
+-        foreach (T7OutputAsset asset in Assets)
+-            foreach (T7Piece piece in asset.Main)
+-                Emit(output, piece);
+-        foreach (T7OutputAsset asset in Assets)
+-            foreach (T7Piece piece in asset.Deferred)
+-                Emit(output, piece);
+-        return output.ToArray();
+-    }
+-
+-    private void Emit(MemoryStream output, T7Piece piece)
+-    {
+-        long at = output.Position;
+-        switch (piece)
+-        {
+-            case T7CopyPiece copy:
+-            {
+-                output.Write(copy.Source.Zone, (int)copy.FileOffset, (int)copy.Size);
+-                MapSpan(copy.Source, copy.FileOffset, copy.Size, at);
+-                foreach ((long field, T7PointerKind kind, T7BlockAddress target) in copy.Source.PointersIn(copy.FileOffset, copy.Size))
+-                {
+-                    if (kind is T7PointerKind.Packed or T7PointerKind.PackedAlias)
+-                    {
+-                        long outField = at + (field - copy.FileOffset);
+-                        _fixups.Add((outField, new T7SourceTarget(copy.Source, target, field)));
+-                        long save = output.Position;
+-                        output.Position = outField;
+-                        output.Write(BitConverter.GetBytes(Placeholder));
+-                        output.Position = save;
+-                    }
+-                }
+-                break;
+-            }
+-            case T7DataPiece data:
+-            {
+-                output.Write(data.Data);
+-                if (data.Source != null && data.Spans != null)
+-                    foreach (T7PieceSpan span in data.Spans)
+-                        MapSpan(data.Source, span.SourceOffset, span.Size, at + span.PieceOffset);
+-                if (data.Pools != null)
+-                    foreach ((string key, long offset) in data.Pools)
+-                        _pools.TryAdd(key, at + offset);
+-                foreach (T7Fixup fixup in data.Fixups)
+-                {
+-                    _fixups.Add((at + fixup.Offset, fixup.Target));
+-                    long save = output.Position;
+-                    output.Position = at + fixup.Offset;
+-                    output.Write(BitConverter.GetBytes(Placeholder));
+-                    output.Position = save;
+-                }
+-                break;
+-            }
+-            default:
+-                throw new InvalidOperationException($"{piece.GetType().Name} cannot be laid out (an unfinished rebuilt read)");
+-        }
+-    }
+-
+-    public List<string> Link(byte[] zone, T7WalkIndex output)
+-    {
+-        var problems = new List<string>();
+-        foreach (var list in _spans.Values)
+-            list.Sort((a, b) => a.Source.CompareTo(b.Source));
+-        foreach ((long field, T7Target target) in _fixups)
+-        {
+-            if (target is T7SourceTarget nulled && NullFields.Contains((nulled.Source, nulled.ReferencingFileOffset)))
+-            {
+-                BinaryPrimitives.WriteUInt64LittleEndian(zone.AsSpan((int)field, 8), 0);
+-                continue;
+-            }
+-            if (!TryResolve(target, output, out T7BlockAddress address, out string? why))
+-            {
+-                if (problems.Count < 200)
+-                    problems.Add($"field 0x{field:x} (output asset {output.AssetAt(field)}): {why}");
+-                continue;
+-            }
+-            BinaryPrimitives.WriteUInt64LittleEndian(zone.AsSpan((int)field, 8), address.Packed);
+-        }
+-        return problems;
+-    }
+-
+-    private bool TryResolve(T7Target target, T7WalkIndex output, out T7BlockAddress address, out string? why)
+-    {
+-        address = T7BlockAddress.None;
+-        why = null;
+-        switch (target)
+-        {
+-            case T7OutputTarget o:
+-                if (output.TryBlockAddress(o.OutputFileOffset, out address))
+-                    return true;
+-                why = $"output offset 0x{o.OutputFileOffset:x} was not read by the loader";
+-                return false;
+-            case T7PoolTarget pool:
+-            {
+-                if (!_pools.TryGetValue(pool.Key, out long pooled))
+-                {
+-                    why = $"no piece defines the pooled data '{pool.Key}'";
+-                    return false;
+-                }
+-                if (output.TryBlockAddress(pooled, out address))
+-                    return true;
+-                why = $"pooled data '{pool.Key}' at output offset 0x{pooled:x} was not read by the loader";
+-                return false;
+-            }
+-            case T7SourceFileTarget f:
+-            {
+-                if (!TryMapOffset(f.Source, f.FileOffset, out long mapped))
+-                {
+-                    why = $"{f.Source.Label} file 0x{f.FileOffset:x} (asset {f.Source.AssetAt(f.FileOffset)}) is not in the output";
+-                    return false;
+-                }
+-                if (output.TryBlockAddress(mapped, out address))
+-                    return true;
+-                why = $"output offset 0x{mapped:x} (from {f.Source.Label} 0x{f.FileOffset:x}) was not read by the loader";
+-                return false;
+-            }
+-            case T7AliasTarget a:
+-            {
+-                IReadOnlyList<T7BlockAddress> slots = output.AliasSlotsOf(a.OutputAsset);
+-                if (a.Slot < slots.Count)
+-                {
+-                    address = slots[a.Slot];
+-                    return true;
+-                }
+-                why = $"output asset {a.OutputAsset} has {slots.Count} alias slots, slot {a.Slot} wanted";
+-                return false;
+-            }
+-            case T7SourceTarget s:
+-            {
+-                if (s.Source.TryAliasOwner(s.Address, out int sourceAsset))
+-                {
+-                    int ordinal = IndexOf(s.Source.AliasSlotsOf(sourceAsset), s.Address);
+-                    if (_assetMap.TryGetValue((s.Source, sourceAsset), out int outputAsset)
+-                        && TryResolve(new T7AliasTarget(outputAsset, ordinal), output, out address, out why))
+-                        return true;
+-                    if (s.Source.TryAliasRegistration(s.Address, out T7Walk.Registration registered) && !string.IsNullOrEmpty(registered.Name)
+-                        && output.TryHeaderCell(registered.Type, OutputName(registered.Type, registered.Name), out address))
+-                        return true;
+-                    if (s.Source.TryAliasHeader(s.Address, out T7BlockAddress header)
+-                        && s.Source.TryRegistrationAt(header, s.Source.Walk.Assets[sourceAsset].Start, out int type, out string? name)
+-                        && name != null && output.TryHeaderCell(type, OutputName(type, name), out address))
+-                        return true;
+-                    why ??= $"{s.Source.Label} asset {sourceAsset} (alias target) has no output asset";
+-                    return false;
+-                }
+-                if (!s.Source.TryFileOffset(s.Address, out long sourceOffset, s.ReferencingFileOffset))
+-                {
+-                    why = $"{s.Source.Label} address {s.Address} holds no file data";
+-                    return false;
+-                }
+-                if (!TryMapOffset(s.Source, sourceOffset, out long outputOffset))
+-                {
+-                    if (TryResolveHeaderCell(s.Source, sourceOffset, output, out address))
+-                        return true;
+-                    why = $"{s.Source.Label} file 0x{sourceOffset:x} (asset {s.Source.AssetAt(sourceOffset)}) is not in the output";
+-                    return false;
+-                }
+-                if (output.TryBlockAddress(outputOffset, out address))
+-                    return true;
+-                why = $"output offset 0x{outputOffset:x} (from {s.Source.Label} 0x{sourceOffset:x}) was not read by the loader";
+-                return false;
+-            }
+-        }
+-        why = "unknown target";
+-        return false;
+-    }
+-
+-    public Func<int, string, string> OutputName { get; set; } = (_, name) => name;
+-
+-    private bool TryResolveHeaderCell(T7WalkIndex source, long cellFileOffset, T7WalkIndex output, out T7BlockAddress address)
+-    {
+-        address = T7BlockAddress.None;
+-        if (!source.Pointers.TryGetValue(cellFileOffset, out var cell) || cell.Kind is not (T7PointerKind.Inline or T7PointerKind.InlineAlias))
+-            return false;
+-        int type;
+-        string? name;
+-        if (source.TryInlineRegistration(cellFileOffset, out T7Walk.Registration exact))
+-            (type, name) = (exact.Type, exact.Name);
+-        else if (!source.TryRegistrationAt(cell.Target, cellFileOffset, out type, out name))
+-            return false;
+-        if (string.IsNullOrEmpty(name))
+-            return false;
+-        return output.TryHeaderCell(type, OutputName(type, name), out address);
+-    }
+-
+-    private static int IndexOf(IReadOnlyList<T7BlockAddress> slots, T7BlockAddress address)
+-    {
+-        for (int i = 0; i < slots.Count; i++)
+-            if (slots[i] == address)
+-                return i;
+-        return 0;
+-    }
+-
+-    private readonly Dictionary<T7WalkIndex, List<(long Start, long Size, T7WalkIndex Other, long OtherStart)>> _equivalents = [];
+-
+-    public void MapEquivalent(T7WalkIndex source, long start, long size, T7WalkIndex other, long otherStart)
+-    {
+-        if (!_equivalents.TryGetValue(source, out var list))
+-            _equivalents[source] = list = [];
+-        list.Add((start, size, other, otherStart));
+-    }
+-
+-    private bool TryMapOffset(T7WalkIndex source, long offset, out long output)
+-    {
+-        if (TryMapDirect(source, offset, out output))
+-            return true;
+-        if (_equivalents.TryGetValue(source, out var equivalents))
+-        {
+-            foreach ((long start, long size, T7WalkIndex other, long otherStart) in equivalents)
+-            {
+-                if (offset >= start && offset < start + size && TryMapDirect(other, otherStart + (offset - start), out output))
+-                    return true;
+-            }
+-        }
+-        return false;
+-    }
+-
+-    private bool TryMapDirect(T7WalkIndex source, long offset, out long output)
+-    {
+-        output = -1;
+-        if (!_spans.TryGetValue(source, out var list))
+-            return false;
+-        int lo = 0, hi = list.Count - 1, found = -1;
+-        while (lo <= hi)
+-        {
+-            int mid = (lo + hi) / 2;
+-            if (list[mid].Source <= offset)
+-            {
+-                found = mid;
+-                lo = mid + 1;
+-            }
+-            else
+-            {
+-                hi = mid - 1;
+-            }
+-        }
+-        for (int i = found; i >= 0 && i > found - 8; i--)
+-        {
+-            (long start, long size, long outStart) = list[i];
+-            if (offset >= start && offset < start + size)
+-            {
+-                output = outStart + (offset - start);
+-                return true;
+-            }
+-        }
+-        return false;
+-    }
+-}
++using System.Buffers.Binary;
++using System.Text;
++using FFPorter.Core.T7.Harness;
++
++namespace FFPorter.Core.T7.Link;
++
++public abstract record T7Target;
++
++public sealed record T7SourceTarget(T7WalkIndex Source, T7BlockAddress Address, long ReferencingFileOffset) : T7Target;
++
++public sealed record T7AliasTarget(int OutputAsset, int Slot = 0) : T7Target;
++
++public sealed record T7OutputTarget(long OutputFileOffset) : T7Target;
++
++public sealed record T7SourceFileTarget(T7WalkIndex Source, long FileOffset) : T7Target;
++
++public sealed record T7PoolTarget(string Key) : T7Target;
++
++public readonly record struct T7Fixup(long Offset, T7Target Target);
++
++public abstract record T7Piece
++{
++    public abstract long Length { get; }
++}
++
++public sealed record T7CopyPiece(T7WalkIndex Source, long FileOffset, long Size) : T7Piece
++{
++    public override long Length => Size;
++}
++
++public readonly record struct T7PieceSpan(long SourceOffset, long Size, long PieceOffset);
++
++public sealed record T7DataPiece(byte[] Data, IReadOnlyList<T7Fixup> Fixups, T7WalkIndex? Source = null, IReadOnlyList<T7PieceSpan>? Spans = null) : T7Piece
++{
++    public override long Length => Data.Length;
++
++    public IReadOnlyList<(string Key, long Offset)>? Pools { get; init; }
++}
++
++public sealed class T7OutputAsset
++{
++    public int Type;
++    public ulong HeaderMarker = ulong.MaxValue;
++    public T7Target? HeaderTarget;
++    public readonly List<T7Piece> Main = [];
++    public readonly List<T7Piece> Deferred = [];
++    public string? Name;
++    public string Origin = "";
++}
++
++public sealed class T7ZoneBuilder
++{
++    public const ulong Placeholder = 0x5000000000000001;
++
++    public List<string?> ScriptStrings { get; } = [];
++    public List<T7OutputAsset> Assets { get; } = [];
++
++    private readonly List<(long Field, T7Target Target)> _fixups = [];
++    private readonly Dictionary<T7WalkIndex, List<(long Source, long Size, long Output)>> _spans = [];
++    private readonly Dictionary<(T7WalkIndex, int), int> _assetMap = [];
++    private readonly Dictionary<(T7WalkIndex, int, int), (int Asset, int Slot)> _slotMap = [];
++
++    public IReadOnlyList<(long Field, T7Target Target)> Fixups => _fixups;
++
++    public HashSet<(T7WalkIndex Source, long Field)> NullFields { get; } = [];
++
++    public void MapAsset(T7WalkIndex source, int sourceAsset, int outputAsset) => _assetMap[(source, sourceAsset)] = outputAsset;
++
++    public bool IsMapped(T7WalkIndex source, int sourceAsset) => _assetMap.ContainsKey((source, sourceAsset));
++
++    public bool TryMapped(T7WalkIndex source, int sourceAsset, out int outputAsset) => _assetMap.TryGetValue((source, sourceAsset), out outputAsset);
++
++    private readonly Dictionary<T7WalkIndex, IReadOnlyList<int>> _stringMaps = [];
++
++    public void MapScriptStrings(T7WalkIndex source, IReadOnlyList<int> outputIndexOfSourceString) => _stringMaps[source] = outputIndexOfSourceString;
++
++    public int AddScriptString(string? text)
++    {
++        if (text != null)
++        {
++            if (_stringIndex.TryGetValue(text, out int existing))
++                return existing;
++            _stringIndex[text] = ScriptStrings.Count;
++        }
++        ScriptStrings.Add(text);
++        return ScriptStrings.Count - 1;
++    }
++
++    private readonly Dictionary<string, int> _stringIndex = new(StringComparer.Ordinal);
++
++    public void MapSpan(T7WalkIndex source, long sourceOffset, long size, long outputOffset)
++    {
++        if (!_spans.TryGetValue(source, out var list))
++            _spans[source] = list = [];
++        list.Add((sourceOffset, size, outputOffset));
++    }
++
++    private readonly Dictionary<string, long> _pools = new(StringComparer.Ordinal);
++
++    public byte[] Layout()
++    {
++        _fixups.Clear();
++        _spans.Clear();
++        _pools.Clear();
++        var output = new MemoryStream();
++        var writer = new BinaryWriter(output);
++        writer.Write(ScriptStrings.Count);
++        writer.Write(0);
++        writer.Write(ScriptStrings.Count > 0 ? ulong.MaxValue : 0UL);
++        writer.Write(0);
++        writer.Write(0);
++        writer.Write(0UL);
++        writer.Write(Assets.Count);
++        writer.Write(0);
++        writer.Write(Assets.Count > 0 ? ulong.MaxValue : 0UL);
++        writer.Flush();
++        long cells = output.Position;
++        foreach (string? text in ScriptStrings)
++            writer.Write(text == null ? 0UL : ulong.MaxValue);
++        var textOffsets = new long[ScriptStrings.Count];
++        for (int i = 0; i < ScriptStrings.Count; i++)
++        {
++            string? text = ScriptStrings[i];
++            writer.Flush();
++            textOffsets[i] = text == null ? -1 : output.Position;
++            if (text != null)
++            {
++                writer.Write(Encoding.UTF8.GetBytes(text));
++                writer.Write((byte)0);
++            }
++        }
++        foreach ((T7WalkIndex source, IReadOnlyList<int> map) in _stringMaps)
++        {
++            for (int s = 0; s < map.Count && s < source.List.ScriptStringOffsets.Count; s++)
++            {
++                int o = map[s];
++                if (o < 0)
++                    continue;
++                (int cell, int textAt) = source.List.ScriptStringOffsets[s];
++                MapSpan(source, cell, 8, cells + 8L * o);
++                if (textAt >= 0 && textOffsets[o] >= 0)
++                    MapSpan(source, textAt, Encoding.UTF8.GetByteCount(ScriptStrings[o]!) + 1, textOffsets[o]);
++            }
++        }
++        writer.Flush();
++        long table = output.Position;
++        foreach (((T7WalkIndex source, int sourceAsset), int outputAsset) in _assetMap)
++            MapSpan(source, source.List.AssetTableOffset + 16L * sourceAsset, 16, table + 16L * outputAsset);
++        foreach (T7OutputAsset asset in Assets)
++        {
++            writer.Write(asset.Type);
++            writer.Write(0);
++            if (asset.HeaderTarget != null)
++            {
++                _fixups.Add((output.Position, asset.HeaderTarget));
++                writer.Write(Placeholder);
++            }
++            else
++            {
++                writer.Write(asset.HeaderMarker);
++            }
++        }
++        writer.Flush();
++        foreach (T7OutputAsset asset in Assets)
++            foreach (T7Piece piece in asset.Main)
++                Emit(output, piece);
++        foreach (T7OutputAsset asset in Assets)
++            foreach (T7Piece piece in asset.Deferred)
++                Emit(output, piece);
++        return output.ToArray();
++    }
++
++    private void Emit(MemoryStream output, T7Piece piece)
++    {
++        long at = output.Position;
++        switch (piece)
++        {
++            case T7CopyPiece copy:
++            {
++                output.Write(copy.Source.Zone, (int)copy.FileOffset, (int)copy.Size);
++                MapSpan(copy.Source, copy.FileOffset, copy.Size, at);
++                foreach ((long field, T7PointerKind kind, T7BlockAddress target) in copy.Source.PointersIn(copy.FileOffset, copy.Size))
++                {
++                    if (kind is T7PointerKind.Packed or T7PointerKind.PackedAlias)
++                    {
++                        long outField = at + (field - copy.FileOffset);
++                        _fixups.Add((outField, new T7SourceTarget(copy.Source, target, field)));
++                        long save = output.Position;
++                        output.Position = outField;
++                        output.Write(BitConverter.GetBytes(Placeholder));
++                        output.Position = save;
++                    }
++                }
++                break;
++            }
++            case T7DataPiece data:
++            {
++                output.Write(data.Data);
++                if (data.Source != null && data.Spans != null)
++                    foreach (T7PieceSpan span in data.Spans)
++                        MapSpan(data.Source, span.SourceOffset, span.Size, at + span.PieceOffset);
++                if (data.Pools != null)
++                    foreach ((string key, long offset) in data.Pools)
++                        _pools.TryAdd(key, at + offset);
++                foreach (T7Fixup fixup in data.Fixups)
++                {
++                    _fixups.Add((at + fixup.Offset, fixup.Target));
++                    long save = output.Position;
++                    output.Position = at + fixup.Offset;
++                    output.Write(BitConverter.GetBytes(Placeholder));
++                    output.Position = save;
++                }
++                break;
++            }
++            default:
++                throw new InvalidOperationException($"{piece.GetType().Name} cannot be laid out (an unfinished rebuilt read)");
++        }
++    }
++
++    public List<string> Link(byte[] zone, T7WalkIndex output)
++    {
++        var problems = new List<string>();
++        foreach (var list in _spans.Values)
++            list.Sort((a, b) => a.Source.CompareTo(b.Source));
++        foreach ((long field, T7Target target) in _fixups)
++        {
++            if (target is T7SourceTarget nulled && NullFields.Contains((nulled.Source, nulled.ReferencingFileOffset)))
++            {
++                BinaryPrimitives.WriteUInt64LittleEndian(zone.AsSpan((int)field, 8), 0);
++                continue;
++            }
++            if (!TryResolve(target, output, out T7BlockAddress address, out string? why))
++            {
++                if (problems.Count < 200)
++                    problems.Add($"field 0x{field:x} (output asset {output.AssetAt(field)}): {why}");
++                continue;
++            }
++            BinaryPrimitives.WriteUInt64LittleEndian(zone.AsSpan((int)field, 8), address.Packed);
++        }
++        return problems;
++    }
++
++    private bool TryResolve(T7Target target, T7WalkIndex output, out T7BlockAddress address, out string? why)
++    {
++        address = T7BlockAddress.None;
++        why = null;
++        switch (target)
++        {
++            case T7OutputTarget o:
++                if (output.TryBlockAddress(o.OutputFileOffset, out address))
++                    return true;
++                why = $"output offset 0x{o.OutputFileOffset:x} was not read by the loader";
++                return false;
++            case T7PoolTarget pool:
++            {
++                if (!_pools.TryGetValue(pool.Key, out long pooled))
++                {
++                    why = $"no piece defines the pooled data '{pool.Key}'";
++                    return false;
++                }
++                if (output.TryBlockAddress(pooled, out address))
++                    return true;
++                why = $"pooled data '{pool.Key}' at output offset 0x{pooled:x} was not read by the loader";
++                return false;
++            }
++            case T7SourceFileTarget f:
++            {
++                if (!TryMapOffset(f.Source, f.FileOffset, out long mapped))
++                {
++                    why = $"{f.Source.Label} file 0x{f.FileOffset:x} (asset {f.Source.AssetAt(f.FileOffset)}) is not in the output";
++                    return false;
++                }
++                if (output.TryBlockAddress(mapped, out address))
++                    return true;
++                why = $"output offset 0x{mapped:x} (from {f.Source.Label} 0x{f.FileOffset:x}) was not read by the loader";
++                return false;
++            }
++            case T7AliasTarget a:
++            {
++                IReadOnlyList<T7BlockAddress> slots = output.AliasSlotsOf(a.OutputAsset);
++                if (a.Slot < slots.Count)
++                {
++                    address = slots[a.Slot];
++                    return true;
++                }
++                why = $"output asset {a.OutputAsset} has {slots.Count} alias slots, slot {a.Slot} wanted";
++                return false;
++            }
++            case T7SourceTarget s:
++            {
++                if (s.Source.TryAliasOwner(s.Address, out int sourceAsset))
++                {
++                    int ordinal = IndexOf(s.Source.AliasSlotsOf(sourceAsset), s.Address);
++                    if (_assetMap.TryGetValue((s.Source, sourceAsset), out int outputAsset)
++                        && TryResolve(new T7AliasTarget(outputAsset, ordinal), output, out address, out why))
++                        return true;
++                    if (s.Source.TryAliasRegistration(s.Address, out T7Walk.Registration registered) && !string.IsNullOrEmpty(registered.Name)
++                        && output.TryHeaderCell(registered.Type, OutputName(registered.Type, registered.Name), out address))
++                        return true;
++                    if (s.Source.TryAliasHeader(s.Address, out T7BlockAddress header)
++                        && s.Source.TryRegistrationAt(header, s.Source.Walk.Assets[sourceAsset].Start, out int type, out string? name)
++                        && name != null && output.TryHeaderCell(type, OutputName(type, name), out address))
++                        return true;
++                    why ??= $"{s.Source.Label} asset {sourceAsset} (alias target) has no output asset";
++                    return false;
++                }
++                if (!s.Source.TryFileOffset(s.Address, out long sourceOffset, s.ReferencingFileOffset))
++                {
++                    why = $"{s.Source.Label} address {s.Address} holds no file data";
++                    return false;
++                }
++                if (!TryMapOffset(s.Source, sourceOffset, out long outputOffset))
++                {
++                    if (TryResolveHeaderCell(s.Source, sourceOffset, output, out address))
++                        return true;
++                    why = $"{s.Source.Label} file 0x{sourceOffset:x} (asset {s.Source.AssetAt(sourceOffset)}) is not in the output";
++                    if (s.Source.TryInlineRegistration(sourceOffset, out T7Walk.Registration named) && !string.IsNullOrEmpty(named.Name))
++                        why += $" [a name cell for {FFPorter.Core.T7.T7AssetTypes.Name(named.Type)} '{named.Name}']";
++                    else if (s.Source.AssetAt(s.ReferencingFileOffset) is int from && from >= 0)
++                        why += $" [from {s.Source.Walk.Assets[from].Name}]";
++                    return false;
++                }
++                if (output.TryBlockAddress(outputOffset, out address))
++                    return true;
++                why = $"output offset 0x{outputOffset:x} (from {s.Source.Label} 0x{sourceOffset:x}) was not read by the loader";
++                return false;
++            }
++        }
++        why = "unknown target";
++        return false;
++    }
++
++    public Func<int, string, string> OutputName { get; set; } = (_, name) => name;
++
++    private bool TryResolveHeaderCell(T7WalkIndex source, long cellFileOffset, T7WalkIndex output, out T7BlockAddress address)
++    {
++        address = T7BlockAddress.None;
++        if (!source.Pointers.TryGetValue(cellFileOffset, out var cell) || cell.Kind is not (T7PointerKind.Inline or T7PointerKind.InlineAlias))
++            return false;
++        int type;
++        string? name;
++        if (source.TryInlineRegistration(cellFileOffset, out T7Walk.Registration exact))
++            (type, name) = (exact.Type, exact.Name);
++        else if (!source.TryRegistrationAt(cell.Target, cellFileOffset, out type, out name))
++            return false;
++        if (string.IsNullOrEmpty(name))
++            return false;
++        return output.TryHeaderCell(type, OutputName(type, name), out address);
++    }
++
++    private static int IndexOf(IReadOnlyList<T7BlockAddress> slots, T7BlockAddress address)
++    {
++        for (int i = 0; i < slots.Count; i++)
++            if (slots[i] == address)
++                return i;
++        return 0;
++    }
++
++    private readonly Dictionary<T7WalkIndex, List<(long Start, long Size, T7WalkIndex Other, long OtherStart)>> _equivalents = [];
++
++    public void MapEquivalent(T7WalkIndex source, long start, long size, T7WalkIndex other, long otherStart)
++    {
++        if (!_equivalents.TryGetValue(source, out var list))
++            _equivalents[source] = list = [];
++        list.Add((start, size, other, otherStart));
++    }
++
++    private bool TryMapOffset(T7WalkIndex source, long offset, out long output)
++    {
++        if (TryMapDirect(source, offset, out output))
++            return true;
++        if (_equivalents.TryGetValue(source, out var equivalents))
++        {
++            foreach ((long start, long size, T7WalkIndex other, long otherStart) in equivalents)
++            {
++                if (offset >= start && offset < start + size && TryMapDirect(other, otherStart + (offset - start), out output))
++                    return true;
++            }
++        }
++        return false;
++    }
++
++    private bool TryMapDirect(T7WalkIndex source, long offset, out long output)
++    {
++        output = -1;
++        if (!_spans.TryGetValue(source, out var list))
++            return false;
++        int lo = 0, hi = list.Count - 1, found = -1;
++        while (lo <= hi)
++        {
++            int mid = (lo + hi) / 2;
++            if (list[mid].Source <= offset)
++            {
++                found = mid;
++                lo = mid + 1;
++            }
++            else
++            {
++                hi = mid - 1;
++            }
++        }
++        for (int i = found; i >= 0 && i > found - 8; i--)
++        {
++            (long start, long size, long outStart) = list[i];
++            if (offset >= start && offset < start + size)
++            {
++                output = outStart + (offset - start);
++                return true;
++            }
++        }
++        return false;
++    }
++}
+--- a/Tool/src/FFPorter.Core.T7/Link/T7Linker.cs
++++ b/Tool/src/FFPorter.Core.T7/Link/T7Linker.cs
+@@ -82,6 +82,14 @@
+         var environment = new Dictionary<string, string?> { ["T7_WALK_LAYOUT"] = layout ? "1" : null, ["T7_WALK_ANY_PLATFORM"] = null };
+         NativeProcessResult result = NativeProcess.Run(T7Ps4Loader.TaskName, T7Ps4Loader.ChildArguments(_loaderDirectory, walkPath, fastFile),
+             new NativeProcessOptions { Environment = environment });
++        if (layout && result.ExitCode != 0)
++        {
++            // The compact layout blocks were too small for this zone: walk again with room for the whole zone in each.
++            _log($"layout walk with compact blocks failed ({result.ExitCode}); retrying with full-size blocks");
++            environment["T7_WALK_LAYOUT_FULL"] = "1";
++            result = NativeProcess.Run(T7Ps4Loader.TaskName, T7Ps4Loader.ChildArguments(_loaderDirectory, walkPath, fastFile),
++                new NativeProcessOptions { Environment = environment });
++        }
+         if (result.ExitCode != 0)
+         {
+             string log = File.Exists(walkPath + ".log.jsonl") ? string.Join("\n", File.ReadLines(walkPath + ".log.jsonl").TakeLast(4)) : "";
+--- a/Tool/src/FFPorter.Core.T7/Harness/T7NativeWalk.cs
++++ b/Tool/src/FFPorter.Core.T7/Harness/T7NativeWalk.cs
+@@ -151,9 +151,16 @@
+     {
+         ulong table = Host.Alloc(16 * Blocks);
+         bool layout = Environment.GetEnvironmentVariable("T7_WALK_LAYOUT") == "1";
++        bool full = Environment.GetEnvironmentVariable("T7_WALK_LAYOUT_FULL") == "1";
++        ulong room = (ulong)Zone.Length + (64UL << 20);
+         for (int i = 0; i < Blocks; i++)
+         {
+-            BlockSize[i] = layout && i is not (7 or 8) ? Math.Max(Header.BlockSize(i), (ulong)Zone.Length + (64UL << 20)) : Header.BlockSize(i);
++            // Layout walks don't know the PS4 block sizes yet, so every block gets room for the whole zone. That is
++            // 7 zone-sized commits, too much for big maps: unless T7_WALK_LAYOUT_FULL is set (the linker's retry), a
++            // block the PC zone leaves empty stays empty and the small ones get 8x their PC size; the guard pages
++            // turn a wrong guess into a failed walk, never a wrong layout.
++            ulong compact = Header.BlockSize(i) == 0 ? 0 : i is 5 or 6 ? room : Math.Min(room, Math.Max(Header.BlockSize(i) * 8, 64UL << 20));
++            BlockSize[i] = layout && i is not (7 or 8) ? (full ? Math.Max(Header.BlockSize(i), room) : Math.Max(Header.BlockSize(i), compact)) : Header.BlockSize(i);
+             BlockBase[i] = i switch
+             {
+                 7 => 0x88888888UL,

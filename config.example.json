@@ -1,0 +1,13 @@
+{
+  "ps4_ip": "192.168.1.50",
+  "ftp_port": 2121,
+  "title_id": "auto",
+  "workdir": "D:/bo3-workshop-ps4-work",
+  "ps4_zones": "",
+  "pc_game": "",
+  "steamcmd": "D:/steamcmd/steamcmd.exe",
+  "steam_user": "",
+  "ffport": "",
+  "upstream_release": "",
+  "min_free_gb": 25
+}
