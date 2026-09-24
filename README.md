@@ -90,7 +90,9 @@ py bo3ps4.py mark 798643901 ok                    # after playing it
 Then **close BO3 completely and start it again** (the mod scans for maps when it loads): Zombies > map select >
 **CUSTOM**.
 
-A small map converts in a few minutes; LEVIATHAN takes ~25 minutes including download and upload.
+The first map takes longer (~20 minutes for a small one): the converter indexes your PS4 and PC game zones once
+and caches them in the workdir. After that a small map takes a few minutes, and LEVIATHAN ~25 minutes including
+download and upload.
 
 ## When a map doesn't work
 
