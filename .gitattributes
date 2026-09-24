@@ -1,0 +1,4 @@
+# Keep the patch byte-exact: it applies to PS4-BO3-Customs checked out with LF (see scripts/build-ffport.ps1).
+*.diff -text
+*.py text eol=lf
+*.ps1 text eol=crlf

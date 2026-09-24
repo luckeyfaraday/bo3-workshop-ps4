@@ -12,11 +12,15 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path "$PSScriptRoot\.."
 
+# The patch is against upstream's files as stored (LF), whatever this machine's core.autocrlf says.
 if (-not (Test-Path "$Source\.git")) {
-    git clone --quiet https://github.com/ItsJokerZz/PS4-BO3-Customs $Source
+    git -c core.autocrlf=false clone --quiet https://github.com/ItsJokerZz/PS4-BO3-Customs $Source
 }
+git -C $Source config core.autocrlf false
 git -C $Source fetch --quiet --tags
 git -C $Source checkout --quiet --force $Tag
+git -C $Source rm --cached -r -q .
+git -C $Source reset --quiet --hard $Tag
 git -C $Source clean -fdq
 
 git -C $Source apply --whitespace=nowarn "$root\patches\ffporter-fixes.diff"
